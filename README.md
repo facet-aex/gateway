@@ -1,6 +1,6 @@
 # gateway
 
-Local Demo Track execution entrypoint for one published, read-only GitHub repository lookup.
+Local Fuji MVP execution entrypoint for published, read-only public HTTPS GET Facets. The existing paid demo uses a preconfigured payer; ADR-0014 adds scoped Agent identity and policy-gated CLI wallet payments next.
 
 **Status:** free invocation and paid x402 invocation are verified with a provider-published Facet, MCP, real GitHub response and one confirmed fUSD transfer on Fuji. The browser and agents call this service, never provider endpoints directly. See the root `docs/implementation/demo-runbook.md` for transaction evidence.
 
