@@ -10,7 +10,11 @@ try {
 if (!process.env.DATABASE_URL) throw new Error("DATABASE_URL is required");
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 try {
-  for (const name of ["0001_demo_runs.sql", "0002_demo_payments.sql"]) {
+  for (const name of [
+    "0001_demo_runs.sql",
+    "0002_demo_payments.sql",
+    "0003_multimodal_runs.sql",
+  ]) {
     await pool.query(
       await readFile(new URL(`../drizzle/${name}`, import.meta.url), "utf8"),
     );

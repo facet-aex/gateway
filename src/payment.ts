@@ -16,6 +16,10 @@ export interface DemoPaymentConfig {
   payTo: string;
   amount: string;
 }
+export interface VersionQuote {
+  amount: string;
+  payTo: string;
+}
 
 const asset = "0xe7082a54a456dc4dfe0ceadcd0d0dce7d8ba176f";
 const network = "eip155:43113";
@@ -39,13 +43,16 @@ export function readPaymentConfig(): DemoPaymentConfig | undefined {
   return { facilitatorUrl, facilitatorToken, payTo, amount };
 }
 
-export function requirements(config: DemoPaymentConfig): PaymentRequirements {
+export function requirements(
+  config: DemoPaymentConfig,
+  quote?: VersionQuote,
+): PaymentRequirements {
   return {
     scheme: "exact",
     network,
     asset,
-    amount: config.amount,
-    payTo: config.payTo,
+    amount: quote?.amount ?? config.amount,
+    payTo: quote?.payTo ?? config.payTo,
     maxTimeoutSeconds: 60,
     extra: { name: "FACET USD", version: "2" },
   };
@@ -55,6 +62,7 @@ export function paymentChallenge(
   config: DemoPaymentConfig,
   versionId: string,
   fingerprint: string,
+  quote?: VersionQuote,
 ) {
   const required: PaymentRequired = {
     x402Version: 2,
@@ -63,7 +71,7 @@ export function paymentChallenge(
       description: "FACET demo read-only API call",
       mimeType: "application/json",
     },
-    accepts: [requirements(config)],
+    accepts: [requirements(config, quote)],
   };
   return { header: encodePaymentRequiredHeader(required), body: required };
 }
@@ -73,12 +81,17 @@ export function decodeAndCheckPayment(
   config: DemoPaymentConfig,
   versionId: string,
   fingerprint: string,
+  quote?: VersionQuote,
 ): PaymentPayload {
   const payload = decodePaymentSignatureHeader(header);
   const accepted = payload.accepted;
-  const expected = requirements(config);
-  const expectedResource = paymentChallenge(config, versionId, fingerprint).body
-    .resource.url;
+  const expected = requirements(config, quote);
+  const expectedResource = paymentChallenge(
+    config,
+    versionId,
+    fingerprint,
+    quote,
+  ).body.resource.url;
   if (
     payload.x402Version !== 2 ||
     payload.resource?.url !== expectedResource ||
@@ -99,6 +112,7 @@ async function facilitatorCall<T>(
   config: DemoPaymentConfig,
   operation: "verify" | "settle",
   paymentPayload: PaymentPayload,
+  quote?: VersionQuote,
 ): Promise<T> {
   const response = await fetch(
     new URL(`/${operation}`, config.facilitatorUrl),
@@ -111,7 +125,7 @@ async function facilitatorCall<T>(
       body: JSON.stringify({
         x402Version: 2,
         paymentPayload,
-        paymentRequirements: requirements(config),
+        paymentRequirements: requirements(config, quote),
       }),
       signal: AbortSignal.timeout(35_000),
     },
@@ -124,8 +138,10 @@ async function facilitatorCall<T>(
 export const verifyPayment = (
   config: DemoPaymentConfig,
   payload: PaymentPayload,
-) => facilitatorCall<VerifyResponse>(config, "verify", payload);
+  quote?: VersionQuote,
+) => facilitatorCall<VerifyResponse>(config, "verify", payload, quote);
 export const settlePayment = (
   config: DemoPaymentConfig,
   payload: PaymentPayload,
-) => facilitatorCall<SettleResponse>(config, "settle", payload);
+  quote?: VersionQuote,
+) => facilitatorCall<SettleResponse>(config, "settle", payload, quote);

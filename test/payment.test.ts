@@ -20,6 +20,29 @@ const versionId = "00000000-0000-4000-8000-000000000001";
 const fingerprint = "a".repeat(64);
 
 describe("Gateway x402 challenge", () => {
+  it("uses a per-version quote for Actor requirements", () => {
+    const quote = {
+      amount: "10000",
+      payTo: "0x0000000000000000000000000000000000000002",
+    };
+    const challenge = paymentChallenge(config, versionId, fingerprint, quote);
+    expect(challenge.body.accepts[0]).toMatchObject(quote);
+    const payload = {
+      x402Version: 2,
+      resource: challenge.body.resource,
+      accepted: challenge.body.accepts[0]!,
+      payload: {},
+    };
+    expect(
+      decodeAndCheckPayment(
+        encodePaymentSignatureHeader(payload),
+        config,
+        versionId,
+        fingerprint,
+        quote,
+      ),
+    ).toEqual(payload);
+  });
   it("issues one exact Fuji requirement bound to the requested version and input fingerprint", () => {
     const challenge = paymentChallenge(config, versionId, fingerprint);
     expect(decodePaymentRequiredHeader(challenge.header)).toEqual(
