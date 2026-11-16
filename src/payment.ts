@@ -178,3 +178,27 @@ export async function contractPaymentCall(
     throw new Error("CONTRACT_RESPONSE_INVALID");
   return result as { status: "PENDING" | "CONFIRMED"; transaction: string };
 }
+
+export async function recordReceiptCall(
+  config: DemoPaymentConfig,
+  body: Record<string, unknown>,
+): Promise<{ status: "PENDING" | "CONFIRMED"; transaction: string }> {
+  const response = await fetch(new URL("/v1/receipt", config.facilitatorUrl), {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-facet-facilitator-token": config.facilitatorToken,
+    },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(40_000),
+  });
+  if (!response.ok) throw new Error("RECEIPT_CALL_FAILED");
+  const result = (await response.json()) as Record<string, unknown>;
+  if (
+    !["PENDING", "CONFIRMED"].includes(String(result.status)) ||
+    typeof result.transaction !== "string" ||
+    !/^0x[0-9a-f]{64}$/iu.test(result.transaction)
+  )
+    throw new Error("RECEIPT_RESPONSE_INVALID");
+  return result as { status: "PENDING" | "CONFIRMED"; transaction: string };
+}

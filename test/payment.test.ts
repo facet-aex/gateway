@@ -9,6 +9,7 @@ import {
   requirements,
   readPaymentConfig,
   contractPaymentCall,
+  recordReceiptCall,
   type DemoPaymentConfig,
 } from "../src/payment.js";
 
@@ -38,6 +39,31 @@ describe("Gateway x402 challenge", () => {
       ).toMatchObject({ status: "PENDING" });
       expect(fetchMock).toHaveBeenCalledWith(
         new URL("/v1/contract/DEPOSIT", config.facilitatorUrl),
+        expect.objectContaining({
+          headers: expect.objectContaining({
+            "x-facet-facilitator-token": config.facilitatorToken,
+          }),
+        }),
+      );
+    } finally {
+      fetchMock.mockRestore();
+    }
+  });
+  it("requires a confirmed or pending receipt transaction response", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          status: "CONFIRMED",
+          transaction: `0x${"b".repeat(64)}`,
+        }),
+      ),
+    );
+    try {
+      expect(
+        await recordReceiptCall(config, { runId: versionId }),
+      ).toMatchObject({ status: "CONFIRMED" });
+      expect(fetchMock).toHaveBeenCalledWith(
+        new URL("/v1/receipt", config.facilitatorUrl),
         expect.objectContaining({
           headers: expect.objectContaining({
             "x-facet-facilitator-token": config.facilitatorToken,
