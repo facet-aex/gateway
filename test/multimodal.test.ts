@@ -35,6 +35,16 @@ describe("multi-modal gateway planning", () => {
     ).toThrow("PAYMENT_AMOUNT_EXCEEDS_CAP");
   });
 
+  it("requires the fee contract for paid Actor per-run execution", () => {
+    expect(() =>
+      quoteVersion(
+        { ...facet, pricingModel: "PAY_PER_RUN" },
+        undefined,
+        100000n,
+      ),
+    ).toThrow("FEE_SPLIT_CONTRACT_REQUIRED");
+  });
+
   it("builds a version-pinned Actor request without endpoint configuration", () => {
     expect(
       buildExecutorRequest(facet, "019a1234-5678-7abc-8def-123456789abe", {

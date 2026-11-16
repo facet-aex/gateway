@@ -29,9 +29,12 @@ export function quoteVersion(
   const amount =
     version.pricingModel === "PAY_PER_RESULT" ? price * 20n : price;
   if (amount > maxAmount) throw new Error("PAYMENT_AMOUNT_EXCEEDS_CAP");
-  if (version.pricingModel === "PAY_PER_RESULT" && !feeSplitAddress)
-    throw new Error("ESCROW_CONTRACT_REQUIRED");
-  const payTo = feeSplitAddress ?? version.payTo;
+  if (version.facetType !== "external_http_api" && !feeSplitAddress)
+    throw new Error("FEE_SPLIT_CONTRACT_REQUIRED");
+  const payTo =
+    version.facetType === "external_http_api"
+      ? version.payTo
+      : (feeSplitAddress ?? version.payTo);
   if (!ADDRESS.test(payTo)) throw new Error("PAYMENT_RECIPIENT_INVALID");
   return {
     pricingModel: version.pricingModel,

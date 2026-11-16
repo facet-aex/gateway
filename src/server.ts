@@ -23,6 +23,7 @@ import {
   quoteVersion,
   type FacetExecutionConfig,
 } from "./multimodal.js";
+import { canonicalJson } from "./canonical.js";
 
 try {
   loadEnvFile();
@@ -110,17 +111,6 @@ async function settleRun(
   }
 }
 
-function canonical(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(canonical);
-  if (value && typeof value === "object")
-    return Object.fromEntries(
-      Object.entries(value)
-        .sort(([a], [b]) => a.localeCompare(b))
-        .map(([key, child]) => [key, canonical(child)]),
-    );
-  return value;
-}
-
 app.get("/health/live", async () => ({ service: "gateway", status: "ok" }));
 app.post<{ Params: { versionId: string }; Body: { input?: unknown } }>(
   "/v1/facet-versions/:versionId/invoke",
@@ -157,7 +147,7 @@ app.post<{ Params: { versionId: string }; Body: { input?: unknown } }>(
         .send({ error: { code: (error as Error).message } });
     }
     const fingerprint = createHash("sha256")
-      .update(JSON.stringify(canonical(input)))
+      .update(canonicalJson(input))
       .digest("hex");
     let quote: { amount: string; payTo: string } | undefined;
     if (paymentConfig) {
@@ -263,7 +253,7 @@ app.post<{ Params: { versionId: string }; Body: { input?: unknown } }>(
           paymentPayload ? JSON.stringify(paymentPayload) : null,
           paymentPayload
             ? createHash("sha256")
-                .update(JSON.stringify(canonical(paymentPayload)))
+                .update(canonicalJson(paymentPayload))
                 .digest("hex")
             : null,
         ],
@@ -389,9 +379,7 @@ app.post<{ Params: { versionId: string }; Body: { input?: unknown } }>(
           JSON.stringify(result),
           JSON.stringify(dataset),
           usage ? JSON.stringify(usage) : null,
-          createHash("sha256")
-            .update(JSON.stringify(canonical(input)))
-            .digest("hex"),
+          createHash("sha256").update(canonicalJson(input)).digest("hex"),
         ],
       );
       if (paymentConfig && paymentPayload)
