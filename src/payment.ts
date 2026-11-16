@@ -32,7 +32,9 @@ export function readPaymentConfig(): DemoPaymentConfig | undefined {
   const amount = process.env.FACET_DEMO_AMOUNT_ATOMIC ?? "1000";
   if (
     !facilitatorUrl ||
-    new URL(facilitatorUrl).hostname !== "127.0.0.1" ||
+    !["127.0.0.1", "x402-facilitator"].includes(
+      new URL(facilitatorUrl).hostname,
+    ) ||
     !facilitatorToken ||
     facilitatorToken.length < 32 ||
     !payTo ||
@@ -145,3 +147,34 @@ export const settlePayment = (
   payload: PaymentPayload,
   quote?: VersionQuote,
 ) => facilitatorCall<SettleResponse>(config, "settle", payload, quote);
+
+export type ContractPhase =
+  "DEPOSIT" | "SETTLE_RUN" | "SETTLE_RESULT" | "REFUND";
+
+export async function contractPaymentCall(
+  config: DemoPaymentConfig,
+  phase: ContractPhase,
+  body: Record<string, unknown>,
+): Promise<{ status: "PENDING" | "CONFIRMED"; transaction: string }> {
+  const response = await fetch(
+    new URL(`/v1/contract/${phase}`, config.facilitatorUrl),
+    {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-facet-facilitator-token": config.facilitatorToken,
+      },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(40_000),
+    },
+  );
+  if (!response.ok) throw new Error(`CONTRACT_${phase}_FAILED`);
+  const result = (await response.json()) as Record<string, unknown>;
+  if (
+    !["PENDING", "CONFIRMED"].includes(String(result.status)) ||
+    typeof result.transaction !== "string" ||
+    !/^0x[0-9a-f]{64}$/iu.test(result.transaction)
+  )
+    throw new Error("CONTRACT_RESPONSE_INVALID");
+  return result as { status: "PENDING" | "CONFIRMED"; transaction: string };
+}
