@@ -8,6 +8,7 @@
     "dev": "tsx src/server.ts",
     "start": "node dist/server.js",
     "db:migrate": "tsx scripts/migrate.ts",
+    "db:migrate:prod": "node scripts/migrate.mjs",
     "smoke:upstream": "tsx scripts/upstream-smoke.ts",
     "db:smoke": "tsx scripts/local-db-smoke.ts",
     "db:smoke:paid": "FACET_PAID_SMOKE=1 tsx scripts/local-db-smoke.ts",

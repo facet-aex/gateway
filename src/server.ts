@@ -432,7 +432,7 @@ app.post<{ Params: { versionId: string }; Body: { input?: unknown } }>(
 );
 
 const port = Number(process.env.FACET_GATEWAY_PORT ?? "4020");
-await app.listen({ host: "127.0.0.1", port });
+await app.listen({ host: process.env.FACET_GATEWAY_HOST ?? "127.0.0.1", port });
 for (const signal of ["SIGINT", "SIGTERM"] as const)
   process.once(signal, () => {
     void app.close().then(() => pool.end());
