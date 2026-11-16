@@ -134,3 +134,41 @@ export async function executeViaExecutor(
     };
   };
 }
+
+export async function signExternalApiResult(
+  runId: string,
+  facetId: string,
+  input: Record<string, unknown>,
+  result: unknown,
+  url: string,
+  token: string,
+) {
+  if (token.length < 32) throw new Error("EXECUTOR_TOKEN_MISSING");
+  const response = await fetch(new URL("/v1/sign-external-result", url), {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-facet-executor-token": token,
+    },
+    body: JSON.stringify({ runId, facetId, input, result }),
+    signal: AbortSignal.timeout(5_000),
+  });
+  if (!response.ok) throw new Error("EXECUTOR_SIGNING_FAILED");
+  const proof = (await response.json()) as Record<string, unknown>;
+  if (
+    proof.itemCount !== 1 ||
+    typeof proof.inputHash !== "string" ||
+    !/^sha256:[0-9a-f]{64}$/iu.test(proof.inputHash) ||
+    typeof proof.outputHash !== "string" ||
+    !/^sha256:[0-9a-f]{64}$/iu.test(proof.outputHash) ||
+    typeof proof.runnerSignature !== "string" ||
+    !/^0x[0-9a-f]{130}$/iu.test(proof.runnerSignature)
+  )
+    throw new Error("EXECUTOR_PROOF_INVALID");
+  return proof as {
+    inputHash: string;
+    outputHash: string;
+    itemCount: 1;
+    runnerSignature: string;
+  };
+}

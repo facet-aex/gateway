@@ -29,8 +29,10 @@ let child: ReturnType<typeof spawn> | undefined;
 const paidMode = process.env.FACET_PAID_SMOKE === "1";
 const payTo = "0x0000000000000000000000000000000000000001";
 const facilitatorToken = "t".repeat(32);
+const executorToken = "e".repeat(32);
 let verifyCount = 0,
-  settleCount = 0;
+  settleCount = 0,
+  signCount = 0;
 const fakeFacilitator = createServer((request, response) => {
   if (request.headers["x-facet-facilitator-token"] !== facilitatorToken) {
     response.writeHead(401).end();
@@ -60,6 +62,25 @@ const fakeFacilitator = createServer((request, response) => {
     return;
   }
   response.writeHead(404).end();
+});
+const fakeExecutor = createServer((request, response) => {
+  if (
+    request.url !== "/v1/sign-external-result" ||
+    request.headers["x-facet-executor-token"] !== executorToken
+  ) {
+    response.writeHead(401).end();
+    return;
+  }
+  signCount++;
+  response.setHeader("content-type", "application/json");
+  response.end(
+    JSON.stringify({
+      inputHash: `sha256:${"a".repeat(64)}`,
+      outputHash: `sha256:${"b".repeat(64)}`,
+      itemCount: 1,
+      runnerSignature: `0x${"c".repeat(130)}`,
+    }),
+  );
 });
 
 async function cleanup() {
@@ -146,10 +167,14 @@ try {
     [facetId, versionId],
   );
 
-  if (paidMode)
+  if (paidMode) {
     await new Promise<void>((resolve) =>
       fakeFacilitator.listen(4023, "127.0.0.1", resolve),
     );
+    await new Promise<void>((resolve) =>
+      fakeExecutor.listen(4033, "127.0.0.1", resolve),
+    );
+  }
   child = spawn(process.execPath, ["dist/server.js"], {
     cwd: process.cwd(),
     env: {
@@ -157,6 +182,8 @@ try {
       FACET_DEMO_X402_ENABLED: paidMode ? "1" : "0",
       FACET_FACILITATOR_URL: "http://127.0.0.1:4023",
       FACET_FACILITATOR_TOKEN: facilitatorToken,
+      FACET_EXECUTOR_TOKEN: executorToken,
+      FACET_EXECUTOR_URL: "http://127.0.0.1:4033",
       FACET_DEMO_PAY_TO: payTo,
       FACET_DEMO_AMOUNT_ATOMIC: "1000",
     },
@@ -233,7 +260,7 @@ try {
   if (conflict.status !== 409)
     throw new Error("Changed-input idempotency conflict was not rejected");
   if (paidMode) {
-    if (verifyCount !== 1 || settleCount !== 1)
+    if (verifyCount !== 1 || settleCount !== 1 || signCount !== 1)
       throw new Error("Paid replay repeated verification or settlement");
     const reusedPayment = await invoke(
       { path: { owner: "octocat", repo: "Hello-World" } },
@@ -248,10 +275,12 @@ try {
   );
 } finally {
   child?.kill("SIGTERM");
-  if (paidMode)
+  if (paidMode) {
     await new Promise<void>((resolve) =>
       fakeFacilitator.close(() => resolve()),
     );
+    await new Promise<void>((resolve) => fakeExecutor.close(() => resolve()));
+  }
   await cleanup();
   await pool.end();
 }

@@ -21,6 +21,7 @@ import {
   buildExecutorRequest,
   executeViaExecutor,
   quoteVersion,
+  signExternalApiResult,
   type FacetExecutionConfig,
 } from "./multimodal.js";
 import { canonicalJson } from "./canonical.js";
@@ -352,25 +353,30 @@ app.post<{ Params: { versionId: string }; Body: { input?: unknown } }>(
       }
     }
     try {
-      const execution =
-        config.facetType === "external_http_api"
-          ? {
-              result: await executeGet(
-                config,
-                input as Record<string, unknown>,
-              ),
-              dataset: [] as Record<string, unknown>[],
-              usage: null,
-            }
-          : await executeViaExecutor(
-              buildExecutorRequest(
-                config,
-                runId,
-                input as Record<string, unknown>,
-              ),
+      let execution;
+      if (config.facetType === "external_http_api") {
+        const result = await executeGet(
+          config,
+          input as Record<string, unknown>,
+        );
+        const usage = paymentConfig
+          ? await signExternalApiResult(
+              runId,
+              config.facetId,
+              input as Record<string, unknown>,
+              result,
               process.env.FACET_EXECUTOR_URL ?? "http://127.0.0.1:4030",
               process.env.FACET_EXECUTOR_TOKEN ?? "",
-            );
+            )
+          : null;
+        execution = { result, dataset: [] as Record<string, unknown>[], usage };
+      } else {
+        execution = await executeViaExecutor(
+          buildExecutorRequest(config, runId, input as Record<string, unknown>),
+          process.env.FACET_EXECUTOR_URL ?? "http://127.0.0.1:4030",
+          process.env.FACET_EXECUTOR_TOKEN ?? "",
+        );
+      }
       const { result, dataset, usage } = execution;
       await pool.query(
         `UPDATE facet_demo_runs SET status='SUCCEEDED', result=$2::jsonb, dataset=$3::jsonb, usage_meta=$4::jsonb, input_hash=$5, updated_at=now() WHERE id=$1`,
