@@ -7,6 +7,7 @@ import { encodePaymentResponseHeader } from "@x402/core/http";
 import {
   decodeAndCheckPayment,
   contractPaymentCall,
+  FacilitatorRequestError,
   paymentChallenge,
   readPaymentConfig,
   recordReceiptCall,
@@ -330,6 +331,50 @@ app.post<{ Params: { versionId: string }; Body: { input?: unknown } }>(
           .code(202)
           .send({ runId: run.id, payment: { status: "receipt_pending" } });
       if (
+        run.status === "EXECUTING" &&
+        run.payment_state === "ESCROW_LOCKED" &&
+        quote?.pricingModel === "PAY_PER_RESULT" &&
+        paymentConfig
+      ) {
+        const stale = await pool.query(
+          "UPDATE facet_demo_runs SET status='FAILED', payment_state='PENDING', error_code='RUN_EXECUTION_UNCERTAIN', updated_at=now() WHERE id=$1 AND status='EXECUTING' AND payment_state='ESCROW_LOCKED' AND updated_at < now()-interval '45 seconds' RETURNING id",
+          [run.id],
+        );
+        if (!stale.rows[0])
+          return reply
+            .code(409)
+            .send({ error: { code: "RUN_IN_PROGRESS" }, runId: run.id });
+        try {
+          const refund = await contractPaymentCall(paymentConfig, "REFUND", {
+            runId: run.id,
+          });
+          await pool.query(
+            "UPDATE facet_demo_runs SET payment_state=$2, payment_tx_hash=$3, updated_at=now() WHERE id=$1",
+            [
+              run.id,
+              refund.status === "CONFIRMED" ? "REFUNDED" : "PENDING",
+              refund.transaction,
+            ],
+          );
+          if (refund.status === "CONFIRMED")
+            return reply.code(502).send({
+              error: { code: "RUN_EXECUTION_UNCERTAIN" },
+              runId: run.id,
+            });
+          return reply.code(202).send({
+            runId: run.id,
+            payment: {
+              status: "refund_pending",
+              transaction: refund.transaction,
+            },
+          });
+        } catch {
+          return reply
+            .code(202)
+            .send({ runId: run.id, payment: { status: "refund_pending" } });
+        }
+      }
+      if (
         run.status === "FAILED" &&
         run.payment_state === "PENDING" &&
         quote?.pricingModel === "PAY_PER_RESULT" &&
@@ -575,7 +620,19 @@ app.post<{ Params: { versionId: string }; Body: { input?: unknown } }>(
           return reply
             .code(409)
             .send({ error: { code: "RUN_IN_PROGRESS" }, runId });
-      } catch {
+      } catch (error) {
+        if (
+          error instanceof FacilitatorRequestError &&
+          (error.status === 400 || error.status === 422)
+        ) {
+          await pool.query(
+            "UPDATE facet_demo_runs SET status='FAILED', payment_state='FAILED', error_code='PAYMENT_INVALID', updated_at=now() WHERE id=$1",
+            [runId],
+          );
+          return reply
+            .code(402)
+            .send({ error: { code: "PAYMENT_INVALID" }, runId });
+        }
         await pool.query(
           "UPDATE facet_demo_runs SET payment_state='PENDING', updated_at=now() WHERE id=$1",
           [runId],
@@ -611,8 +668,8 @@ app.post<{ Params: { versionId: string }; Body: { input?: unknown } }>(
         );
       }
       const { result, dataset, usage } = execution;
-      await pool.query(
-        `UPDATE facet_demo_runs SET status='SUCCEEDED', result=$2::jsonb, dataset=$3::jsonb, usage_meta=$4::jsonb, input_hash=$5, updated_at=now() WHERE id=$1`,
+      const persisted = await pool.query(
+        `UPDATE facet_demo_runs SET status='SUCCEEDED', result=$2::jsonb, dataset=$3::jsonb, usage_meta=$4::jsonb, input_hash=$5, updated_at=now() WHERE id=$1 AND status='EXECUTING' RETURNING id`,
         [
           runId,
           JSON.stringify(result),
@@ -621,6 +678,10 @@ app.post<{ Params: { versionId: string }; Body: { input?: unknown } }>(
           createHash("sha256").update(canonicalJson(input)).digest("hex"),
         ],
       );
+      if (!persisted.rows[0])
+        return reply
+          .code(202)
+          .send({ runId, payment: { status: "refund_pending" } });
       if (paymentConfig && paymentPayload)
         return settleRun(
           {
@@ -652,10 +713,14 @@ app.post<{ Params: { versionId: string }; Body: { input?: unknown } }>(
       const code = /^(UPSTREAM_|INPUT_)[A-Z0-9_]+$/u.test(message)
         ? message
         : "UPSTREAM_REQUEST_FAILED";
-      await pool.query(
-        `UPDATE facet_demo_runs SET status='FAILED', error_code=$2, updated_at=now() WHERE id=$1`,
+      const failed = await pool.query(
+        `UPDATE facet_demo_runs SET status='FAILED', error_code=$2, updated_at=now() WHERE id=$1 AND status='EXECUTING' RETURNING id`,
         [runId, code],
       );
+      if (!failed.rows[0])
+        return reply
+          .code(202)
+          .send({ runId, payment: { status: "refund_pending" } });
       if (paymentConfig && quote?.pricingModel === "PAY_PER_RESULT") {
         try {
           const refund = await contractPaymentCall(paymentConfig, "REFUND", {

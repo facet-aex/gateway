@@ -1,10 +1,11 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { createRequire } from "node:module";
 import { loadEnvFile } from "node:process";
 import { setTimeout as delay } from "node:timers/promises";
 import { Pool } from "pg";
+import { canonicalJson } from "../src/canonical.js";
 import {
   decodePaymentRequiredHeader,
   encodePaymentSignatureHeader,
@@ -45,6 +46,7 @@ let verifyCount = 0,
   depositCount = 0,
   settleResultCount = 0,
   refundCount = 0;
+let rejectNextDeposit = false;
 const fakeFacilitator = createServer((request, response) => {
   if (request.headers["x-facet-facilitator-token"] !== facilitatorToken) {
     response.writeHead(401).end();
@@ -86,6 +88,13 @@ const fakeFacilitator = createServer((request, response) => {
   }
   if (request.url === "/v1/contract/DEPOSIT") {
     depositCount++;
+    if (rejectNextDeposit) {
+      rejectNextDeposit = false;
+      response
+        .writeHead(400)
+        .end(JSON.stringify({ error: "CONTRACT_PAYMENT_INVALID" }));
+      return;
+    }
     response.end(
       JSON.stringify({
         status: "CONFIRMED",
@@ -448,6 +457,62 @@ try {
       failedRun.rows[0]?.status !== "FAILED"
     )
       throw new Error("Refund state was not persisted");
+    const staleKey = randomUUID();
+    const staleRunId = randomUUID();
+    const staleInput = { path: { owner: "octocat", repo: "Hello-World" } };
+    const staleFingerprint = createHash("sha256")
+      .update(canonicalJson(staleInput))
+      .digest("hex");
+    await pool.query(
+      "INSERT INTO facet_demo_runs(id,caller_id,facet_version_id,idempotency_key,request_fingerprint,status,payment_state,updated_at) VALUES($1,'local-demo-agent',$2,$3,$4,'EXECUTING','ESCROW_LOCKED',now()-interval '60 seconds')",
+      [staleRunId, versionId, staleKey, staleFingerprint],
+    );
+    const staleResponse = await invoke(staleInput, undefined, staleKey);
+    const recovered = await pool.query(
+      "SELECT status,payment_state FROM facet_demo_runs WHERE id=$1",
+      [staleRunId],
+    );
+    if (
+      staleResponse.status !== 502 ||
+      refundCount !== 2 ||
+      recovered.rows[0]?.status !== "FAILED" ||
+      recovered.rows[0]?.payment_state !== "REFUNDED"
+    )
+      throw new Error(
+        "Stale escrow was not refunded without rerunning workload",
+      );
+    rejectNextDeposit = true;
+    const rejectKey = randomUUID();
+    const rejectInput = { path: { owner: "octocat", repo: "Hello-World" } };
+    const rejectChallengeResponse = await invoke(
+      rejectInput,
+      undefined,
+      rejectKey,
+    );
+    const rejectChallenge = decodePaymentRequiredHeader(
+      rejectChallengeResponse.headers.get("PAYMENT-REQUIRED")!,
+    );
+    const rejectSignature = encodePaymentSignatureHeader({
+      x402Version: 2,
+      resource: rejectChallenge.resource,
+      accepted: rejectChallenge.accepts[0]!,
+      payload: { authorization: { nonce: `0x${"8".repeat(64)}` } },
+    });
+    const rejectResponse = await invoke(
+      rejectInput,
+      rejectSignature,
+      rejectKey,
+    );
+    const rejectedRun = await pool.query(
+      "SELECT status,payment_state FROM facet_demo_runs WHERE facet_version_id=$1 AND idempotency_key=$2",
+      [versionId, rejectKey],
+    );
+    if (
+      rejectResponse.status !== 402 ||
+      rejectedRun.rows[0]?.status !== "FAILED" ||
+      rejectedRun.rows[0]?.payment_state !== "FAILED"
+    )
+      throw new Error("Invalid authorization remained pending");
   }
   process.stdout.write(
     `Gateway PostgreSQL + real GitHub ${liveFuji ? "Fuji paid " : paidMode ? "mock-facilitator paid " : ""}invocation, replay and conflict passed.\n`,

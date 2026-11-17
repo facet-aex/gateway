@@ -151,6 +151,15 @@ export const settlePayment = (
 export type ContractPhase =
   "DEPOSIT" | "SETTLE_RUN" | "SETTLE_RESULT" | "REFUND";
 
+export class FacilitatorRequestError extends Error {
+  constructor(
+    public readonly status: number,
+    operation: string,
+  ) {
+    super(`FACILITATOR_${operation}_HTTP_${status}`);
+  }
+}
+
 export async function contractPaymentCall(
   config: DemoPaymentConfig,
   phase: ContractPhase,
@@ -168,7 +177,8 @@ export async function contractPaymentCall(
       signal: AbortSignal.timeout(40_000),
     },
   );
-  if (!response.ok) throw new Error(`CONTRACT_${phase}_FAILED`);
+  if (!response.ok)
+    throw new FacilitatorRequestError(response.status, `CONTRACT_${phase}`);
   const result = (await response.json()) as Record<string, unknown>;
   if (
     !["PENDING", "CONFIRMED"].includes(String(result.status)) ||
