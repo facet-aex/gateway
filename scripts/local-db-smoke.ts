@@ -27,12 +27,18 @@ const unique = randomUUID().slice(0, 8);
 const baseUrl = `http://127.0.0.1:${process.env.FACET_GATEWAY_PORT ?? "4020"}`;
 let child: ReturnType<typeof spawn> | undefined;
 const paidMode = process.env.FACET_PAID_SMOKE === "1";
+const contractMode = process.env.FACET_CONTRACT_SMOKE === "1";
+const pendingReceiptMode = process.env.FACET_PENDING_RECEIPT_SMOKE === "1";
 const payTo = "0x0000000000000000000000000000000000000001";
 const facilitatorToken = "t".repeat(32);
 const executorToken = "e".repeat(32);
 let verifyCount = 0,
   settleCount = 0,
-  signCount = 0;
+  signCount = 0,
+  receiptCount = 0,
+  depositCount = 0,
+  settleResultCount = 0,
+  refundCount = 0;
 const fakeFacilitator = createServer((request, response) => {
   if (request.headers["x-facet-facilitator-token"] !== facilitatorToken) {
     response.writeHead(401).end();
@@ -57,6 +63,47 @@ const fakeFacilitator = createServer((request, response) => {
         transaction: `0x${"1".repeat(64)}`,
         network: "eip155:43113",
         payer: "0x0000000000000000000000000000000000000002",
+      }),
+    );
+    return;
+  }
+  if (request.url === "/v1/receipt") {
+    receiptCount++;
+    response.end(
+      JSON.stringify({
+        status:
+          pendingReceiptMode && receiptCount === 1 ? "PENDING" : "CONFIRMED",
+        transaction: `0x${"3".repeat(64)}`,
+      }),
+    );
+    return;
+  }
+  if (request.url === "/v1/contract/DEPOSIT") {
+    depositCount++;
+    response.end(
+      JSON.stringify({
+        status: "CONFIRMED",
+        transaction: `0x${"4".repeat(64)}`,
+      }),
+    );
+    return;
+  }
+  if (request.url === "/v1/contract/SETTLE_RESULT") {
+    settleResultCount++;
+    response.end(
+      JSON.stringify({
+        status: "CONFIRMED",
+        transaction: `0x${"5".repeat(64)}`,
+      }),
+    );
+    return;
+  }
+  if (request.url === "/v1/contract/REFUND") {
+    refundCount++;
+    response.end(
+      JSON.stringify({
+        status: "CONFIRMED",
+        transaction: `0x${"6".repeat(64)}`,
       }),
     );
     return;
@@ -166,6 +213,11 @@ try {
     "UPDATE facets SET current_published_version_id=$2 WHERE id=$1",
     [facetId, versionId],
   );
+  if (contractMode)
+    await pool.query(
+      "UPDATE facet_versions SET pricing_model='PAY_PER_RESULT', price_atomic='1000', pay_to=$2 WHERE id=$1",
+      [versionId, payTo],
+    );
 
   if (paidMode) {
     await new Promise<void>((resolve) =>
@@ -186,6 +238,10 @@ try {
       FACET_EXECUTOR_URL: "http://127.0.0.1:4033",
       FACET_DEMO_PAY_TO: payTo,
       FACET_DEMO_AMOUNT_ATOMIC: "1000",
+      FACET_FEE_SPLIT_ADDRESS: contractMode
+        ? "0x0000000000000000000000000000000000000004"
+        : "",
+      FACET_RECEIPT_LOG_ADDRESS: "0x0000000000000000000000000000000000000005",
     },
     stdio: "ignore",
   });
@@ -235,6 +291,11 @@ try {
       signature,
     );
   }
+  if (pendingReceiptMode) {
+    if (first.status !== 202)
+      throw new Error("Pending receipt was reported as settled");
+    first = await invoke({ path: { owner: "octocat", repo: "Hello-World" } });
+  }
   if (first.status !== 200)
     throw new Error(
       `First invocation failed: ${first.status} ${await first.text()}`,
@@ -242,12 +303,30 @@ try {
   const firstBody = (await first.json()) as {
     result: { full_name: string };
     replayed: boolean;
+    receipt?: {
+      inputHash: string;
+      outputHash: string;
+      itemCount: number;
+      paymentTxHash: string;
+      receiptTxHash: string;
+      runnerSignature: string;
+    };
   };
   if (
     firstBody.result.full_name !== "octocat/Hello-World" ||
     firstBody.replayed
   )
     throw new Error("Unexpected upstream result");
+  if (
+    paidMode &&
+    (!firstBody.receipt?.inputHash ||
+      !firstBody.receipt?.outputHash ||
+      firstBody.receipt.itemCount !== 1 ||
+      !firstBody.receipt.paymentTxHash ||
+      !firstBody.receipt.receiptTxHash ||
+      !firstBody.receipt.runnerSignature)
+  )
+    throw new Error("Paid response omitted receipt proof");
   const replay = await invoke({
     path: { repo: "Hello-World", owner: "octocat" },
   });
@@ -260,7 +339,14 @@ try {
   if (conflict.status !== 409)
     throw new Error("Changed-input idempotency conflict was not rejected");
   if (paidMode) {
-    if (verifyCount !== 1 || settleCount !== 1 || signCount !== 1)
+    if (
+      verifyCount !== 1 ||
+      settleCount !== (contractMode ? 0 : 1) ||
+      depositCount !== (contractMode ? 1 : 0) ||
+      settleResultCount !== (contractMode ? 1 : 0) ||
+      signCount !== 1 ||
+      receiptCount !== (pendingReceiptMode ? 2 : 1)
+    )
       throw new Error("Paid replay repeated verification or settlement");
     const reusedPayment = await invoke(
       { path: { owner: "octocat", repo: "Hello-World" } },
@@ -269,6 +355,46 @@ try {
     );
     if (reusedPayment.status !== 409)
       throw new Error("Payment signature was reused for another Run");
+  }
+  if (contractMode) {
+    const missingInput = {
+      path: { owner: "octocat", repo: `facet-missing-${unique}` },
+    };
+    const failedKey = randomUUID();
+    const challengeResponse = await invoke(missingInput, undefined, failedKey);
+    if (challengeResponse.status !== 402)
+      throw new Error("Failure path did not issue payment challenge");
+    const challenge = decodePaymentRequiredHeader(
+      challengeResponse.headers.get("PAYMENT-REQUIRED")!,
+    );
+    const failureSignature = encodePaymentSignatureHeader({
+      x402Version: 2,
+      resource: challenge.resource,
+      accepted: challenge.accepts[0]!,
+      payload: { authorization: { nonce: `0x${"7".repeat(64)}` } },
+    });
+    const failedResponse = await invoke(
+      missingInput,
+      failureSignature,
+      failedKey,
+    );
+    if (
+      failedResponse.status !== 502 ||
+      refundCount !== 1 ||
+      depositCount !== 2
+    )
+      throw new Error(
+        `Escrow failure did not refund: ${failedResponse.status}`,
+      );
+    const failedRun = await pool.query(
+      "SELECT payment_state, status FROM facet_demo_runs WHERE facet_version_id=$1 AND idempotency_key=$2",
+      [versionId, failedKey],
+    );
+    if (
+      failedRun.rows[0]?.payment_state !== "REFUNDED" ||
+      failedRun.rows[0]?.status !== "FAILED"
+    )
+      throw new Error("Refund state was not persisted");
   }
   process.stdout.write(
     `Gateway PostgreSQL + real GitHub ${paidMode ? "mock-facilitator paid " : ""}invocation, replay and conflict passed.\n`,

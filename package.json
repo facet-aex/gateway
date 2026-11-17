@@ -12,6 +12,8 @@
     "smoke:upstream": "tsx scripts/upstream-smoke.ts",
     "db:smoke": "tsx scripts/local-db-smoke.ts",
     "db:smoke:paid": "FACET_PAID_SMOKE=1 tsx scripts/local-db-smoke.ts",
+    "db:smoke:contract": "FACET_PAID_SMOKE=1 FACET_CONTRACT_SMOKE=1 tsx scripts/local-db-smoke.ts",
+    "db:smoke:receipt-pending": "FACET_PAID_SMOKE=1 FACET_PENDING_RECEIPT_SMOKE=1 tsx scripts/local-db-smoke.ts",
     "db:smoke:multimodal": "tsx scripts/multimodal-db-smoke.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",

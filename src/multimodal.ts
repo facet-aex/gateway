@@ -31,8 +31,11 @@ export function quoteVersion(
   if (amount > maxAmount) throw new Error("PAYMENT_AMOUNT_EXCEEDS_CAP");
   if (version.facetType !== "external_http_api" && !feeSplitAddress)
     throw new Error("FEE_SPLIT_CONTRACT_REQUIRED");
+  if (version.pricingModel === "PAY_PER_RESULT" && !feeSplitAddress)
+    throw new Error("FEE_SPLIT_CONTRACT_REQUIRED");
   const payTo =
-    version.facetType === "external_http_api"
+    version.facetType === "external_http_api" &&
+    version.pricingModel === "PAY_PER_RUN"
       ? version.payTo
       : (feeSplitAddress ?? version.payTo);
   if (!ADDRESS.test(payTo)) throw new Error("PAYMENT_RECIPIENT_INVALID");

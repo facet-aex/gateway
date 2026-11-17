@@ -45,6 +45,23 @@ describe("multi-modal gateway planning", () => {
     ).toThrow("FEE_SPLIT_CONTRACT_REQUIRED");
   });
 
+  it("routes per-result API payments through escrow", () => {
+    expect(
+      quoteVersion(
+        { ...facet, facetType: "external_http_api" },
+        "0x0000000000000000000000000000000000000002",
+        100000n,
+      ).payTo,
+    ).toBe("0x0000000000000000000000000000000000000002");
+    expect(() =>
+      quoteVersion(
+        { ...facet, facetType: "external_http_api" },
+        undefined,
+        100000n,
+      ),
+    ).toThrow("FEE_SPLIT_CONTRACT_REQUIRED");
+  });
+
   it("builds a version-pinned Actor request without endpoint configuration", () => {
     expect(
       buildExecutorRequest(facet, "019a1234-5678-7abc-8def-123456789abe", {
