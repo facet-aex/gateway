@@ -1,8 +1,13 @@
 import { createHash, randomUUID } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
+import { createRequire } from "node:module";
 import { loadEnvFile } from "node:process";
 import { setTimeout as delay } from "node:timers/promises";
 import { Pool } from "pg";
+import {
+  decodePaymentRequiredHeader,
+  encodePaymentSignatureHeader,
+} from "@x402/core/http";
 
 try {
   loadEnvFile();
@@ -10,6 +15,11 @@ try {
   if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 }
 if (!process.env.DATABASE_URL) throw new Error("DATABASE_URL required");
+const liveFuji = process.env.FACET_LIVE_FUJI_SMOKE === "1";
+if (liveFuji) loadEnvFile("../mcp-server/.env");
+const facilitatorRequire = createRequire(
+  new URL("../../x402-facilitator/package.json", import.meta.url),
+);
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 const ids = {
   user: randomUUID(),
@@ -139,7 +149,7 @@ try {
       ],
     );
     await pool.query(
-      `INSERT INTO facet_versions (id,facet_id,version,status,source_version_id,source_operation_pointer,manifest,content_hash,endpoint_config_id,operation,input_schema,output_schema,created_by,published_at,actor_code,image_digest,pricing_model,price_atomic,pay_to,erc8004_token_id,erc8004_registry,agent_task_kind) VALUES ($1,$2,'1.0.0','published',$3,$4,$5::jsonb,$6,NULL,$7::jsonb,$8::jsonb,$9::jsonb,$10,now(),$11,$12,'PAY_PER_RUN','1000',$13,$14,$15,$16)`,
+      `INSERT INTO facet_versions (id,facet_id,version,status,source_version_id,source_operation_pointer,manifest,content_hash,endpoint_config_id,operation,input_schema,output_schema,created_by,published_at,actor_code,image_digest,pricing_model,price_atomic,pay_to,erc8004_token_id,erc8004_registry,agent_task_kind) VALUES ($1,$2,'1.0.0','published',$3,$4,$5::jsonb,$6,NULL,$7::jsonb,$8::jsonb,$9::jsonb,$10,now(),$11,$12,$17,'1000',$13,$14,$15,$16)`,
       [
         facet.version,
         facet.id,
@@ -153,10 +163,15 @@ try {
         ids.user,
         facet.code,
         facet.digest,
-        "0x0000000000000000000000000000000000000001",
+        liveFuji
+          ? process.env.FACET_DEMO_PAY_TO
+          : "0x0000000000000000000000000000000000000001",
         facet.tokenId,
         facet.registry,
         facet.taskKind,
+        liveFuji && facet.type === "hosted_actor"
+          ? "PAY_PER_RESULT"
+          : "PAY_PER_RUN",
       ],
     );
     await pool.query(
@@ -165,28 +180,37 @@ try {
     );
   }
 
-  children.push(
-    spawn(process.execPath, ["../executor/dist/server.js"], {
-      env: {
-        ...process.env,
-        FACET_ENV: "local",
-        FACET_RUNNER_MODE: "subprocess",
-        FACET_RUNNER_PRIVATE_KEY: runnerKey,
-        FACET_EXECUTOR_TOKEN: executorToken,
-        FACET_EXECUTOR_PORT: "4130",
-      },
-      stdio: "ignore",
-    }),
+  if (!liveFuji)
+    children.push(
+      spawn(process.execPath, ["../executor/dist/server.js"], {
+        env: {
+          ...process.env,
+          FACET_ENV: "local",
+          FACET_RUNNER_MODE: "subprocess",
+          FACET_RUNNER_PRIVATE_KEY: runnerKey,
+          FACET_EXECUTOR_TOKEN: executorToken,
+          FACET_EXECUTOR_PORT: "4130",
+        },
+        stdio: "ignore",
+      }),
+    );
+  await waitFor(
+    liveFuji
+      ? "http://127.0.0.1:4030/health/live"
+      : "http://127.0.0.1:4130/health/live",
   );
-  await waitFor("http://127.0.0.1:4130/health/live");
   children.push(
     spawn(process.execPath, ["dist/server.js"], {
       env: {
         ...process.env,
-        FACET_DEMO_X402_ENABLED: "0",
+        FACET_DEMO_X402_ENABLED: liveFuji ? "1" : "0",
         FACET_GATEWAY_PORT: "4120",
-        FACET_EXECUTOR_URL: "http://127.0.0.1:4130",
-        FACET_EXECUTOR_TOKEN: executorToken,
+        FACET_EXECUTOR_URL: liveFuji
+          ? "http://127.0.0.1:4030"
+          : "http://127.0.0.1:4130",
+        FACET_EXECUTOR_TOKEN: liveFuji
+          ? process.env.FACET_EXECUTOR_TOKEN
+          : executorToken,
       },
       stdio: "ignore",
     }),
@@ -223,13 +247,44 @@ try {
   ];
   for (const { version, input, expected } of inputs) {
     const key = randomUUID();
-    const invoke = () =>
+    const invoke = (signature?: string) =>
       fetch(`http://127.0.0.1:4120/v1/facet-versions/${version}/invoke`, {
         method: "POST",
-        headers: { "content-type": "application/json", "idempotency-key": key },
+        headers: {
+          "content-type": "application/json",
+          "idempotency-key": key,
+          ...(signature ? { "PAYMENT-SIGNATURE": signature } : {}),
+        },
         body: JSON.stringify({ input }),
       });
-    const first = await invoke();
+    let first = await invoke();
+    if (liveFuji) {
+      if (first.status !== 402)
+        throw new Error(`Expected x402 challenge, got ${first.status}`);
+      const challenge = decodePaymentRequiredHeader(
+        first.headers.get("PAYMENT-REQUIRED")!,
+      );
+      const { ExactEvmScheme } = facilitatorRequire("@x402/evm/exact/client");
+      const { privateKeyToAccount } = facilitatorRequire("viem/accounts");
+      const payer = privateKeyToAccount(
+        process.env.FACET_DEMO_PAYER_PRIVATE_KEY,
+      );
+      const signed = await new ExactEvmScheme({
+        address: payer.address,
+        signTypedData: (args: unknown) => payer.signTypedData(args),
+      }).createPaymentPayload(2, challenge.accepts[0]);
+      const signature = encodePaymentSignatureHeader({
+        x402Version: 2,
+        resource: challenge.resource,
+        accepted: challenge.accepts[0],
+        payload: signed.payload,
+      });
+      first = await invoke(signature);
+      for (let attempt = 0; first.status === 202 && attempt < 8; attempt++) {
+        await delay(1500);
+        first = await invoke();
+      }
+    }
     if (first.status !== 200)
       throw new Error(
         `First ${version} invoke failed: ${first.status} ${await first.text()}`,
@@ -239,6 +294,8 @@ try {
       dataset: unknown[];
       usage: { itemCount: number };
       replayed: boolean;
+      payment?: { transaction: string };
+      receipt?: { paymentTxHash: string; receiptTxHash: string };
     };
     if (
       body.dataset.length !== expected ||
@@ -246,6 +303,13 @@ try {
       body.replayed
     )
       throw new Error(`Wrong ${version} dataset/usage`);
+    if (
+      liveFuji &&
+      (!body.payment?.transaction ||
+        body.receipt?.paymentTxHash !== body.payment.transaction ||
+        !body.receipt.receiptTxHash)
+    )
+      throw new Error(`Missing ${version} payment/receipt proof`);
     const replay = await invoke();
     const replayBody = (await replay.json()) as {
       runId: string;
@@ -268,6 +332,15 @@ try {
       stored.rows[0]?.usage_meta.itemCount !== expected
     )
       throw new Error(`Wrong ${version} persistence`);
+    if (liveFuji)
+      process.stdout.write(
+        JSON.stringify({
+          facetVersionId: version,
+          runId: body.runId,
+          paymentTxHash: body.payment?.transaction,
+          receiptTxHash: body.receipt?.receiptTxHash,
+        }) + "\n",
+      );
   }
   process.stdout.write(
     "Gateway Actor/Agent PostgreSQL invocation, dataset, signed usage and replay passed.\n",
