@@ -26,9 +26,14 @@ const facetId = randomUUID(),
   versionId = randomUUID(),
   endpointId = randomUUID();
 const unique = randomUUID().slice(0, 8);
-const baseUrl = `http://127.0.0.1:${process.env.FACET_GATEWAY_PORT ?? "4020"}`;
-let child: ReturnType<typeof spawn> | undefined;
 const liveFuji = process.env.FACET_LIVE_FUJI_API_SMOKE === "1";
+const deployedGatewayUrl = process.env.FACET_DEPLOYED_GATEWAY_URL;
+if (deployedGatewayUrl && !liveFuji)
+  throw new Error("FACET_DEPLOYED_GATEWAY_URL requires live Fuji mode");
+const baseUrl =
+  deployedGatewayUrl ??
+  `http://127.0.0.1:${process.env.FACET_GATEWAY_PORT ?? "4020"}`;
+let child: ReturnType<typeof spawn> | undefined;
 if (liveFuji) loadEnvFile("../mcp-server/.env");
 const facilitatorRequire = createRequire(
   new URL("../../x402-facilitator/package.json", import.meta.url),
@@ -242,36 +247,37 @@ try {
       fakeExecutor.listen(4033, "127.0.0.1", resolve),
     );
   }
-  child = spawn(process.execPath, ["dist/server.js"], {
-    cwd: process.cwd(),
-    env: {
-      ...process.env,
-      FACET_DEMO_X402_ENABLED: paidMode ? "1" : "0",
-      FACET_FACILITATOR_URL: liveFuji
-        ? "http://127.0.0.1:4022"
-        : "http://127.0.0.1:4023",
-      FACET_FACILITATOR_TOKEN: liveFuji
-        ? process.env.FACET_FACILITATOR_TOKEN
-        : facilitatorToken,
-      FACET_EXECUTOR_TOKEN: liveFuji
-        ? process.env.FACET_EXECUTOR_TOKEN
-        : executorToken,
-      FACET_EXECUTOR_URL: liveFuji
-        ? "http://127.0.0.1:4030"
-        : "http://127.0.0.1:4033",
-      FACET_DEMO_PAY_TO: liveFuji ? process.env.FACET_DEMO_PAY_TO : payTo,
-      FACET_DEMO_AMOUNT_ATOMIC: "1000",
-      FACET_FEE_SPLIT_ADDRESS: liveFuji
-        ? process.env.FACET_FEE_SPLIT_ADDRESS
-        : contractMode
-          ? "0x0000000000000000000000000000000000000004"
-          : "",
-      FACET_RECEIPT_LOG_ADDRESS: liveFuji
-        ? process.env.FACET_RECEIPT_LOG_ADDRESS
-        : "0x0000000000000000000000000000000000000005",
-    },
-    stdio: "ignore",
-  });
+  if (!deployedGatewayUrl)
+    child = spawn(process.execPath, ["dist/server.js"], {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        FACET_DEMO_X402_ENABLED: paidMode ? "1" : "0",
+        FACET_FACILITATOR_URL: liveFuji
+          ? "http://127.0.0.1:4022"
+          : "http://127.0.0.1:4023",
+        FACET_FACILITATOR_TOKEN: liveFuji
+          ? process.env.FACET_FACILITATOR_TOKEN
+          : facilitatorToken,
+        FACET_EXECUTOR_TOKEN: liveFuji
+          ? process.env.FACET_EXECUTOR_TOKEN
+          : executorToken,
+        FACET_EXECUTOR_URL: liveFuji
+          ? "http://127.0.0.1:4030"
+          : "http://127.0.0.1:4033",
+        FACET_DEMO_PAY_TO: liveFuji ? process.env.FACET_DEMO_PAY_TO : payTo,
+        FACET_DEMO_AMOUNT_ATOMIC: "1000",
+        FACET_FEE_SPLIT_ADDRESS: liveFuji
+          ? process.env.FACET_FEE_SPLIT_ADDRESS
+          : contractMode
+            ? "0x0000000000000000000000000000000000000004"
+            : "",
+        FACET_RECEIPT_LOG_ADDRESS: liveFuji
+          ? process.env.FACET_RECEIPT_LOG_ADDRESS
+          : "0x0000000000000000000000000000000000000005",
+      },
+      stdio: "ignore",
+    });
   let ready = false;
   for (let attempt = 0; attempt < 30; attempt++) {
     try {

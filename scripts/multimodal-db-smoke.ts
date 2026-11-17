@@ -16,6 +16,10 @@ try {
 }
 if (!process.env.DATABASE_URL) throw new Error("DATABASE_URL required");
 const liveFuji = process.env.FACET_LIVE_FUJI_SMOKE === "1";
+const deployedGatewayUrl = process.env.FACET_DEPLOYED_GATEWAY_URL;
+if (deployedGatewayUrl && !liveFuji)
+  throw new Error("FACET_DEPLOYED_GATEWAY_URL requires live Fuji mode");
+const gatewayUrl = deployedGatewayUrl ?? "http://127.0.0.1:4120";
 if (liveFuji) loadEnvFile("../mcp-server/.env");
 const facilitatorRequire = createRequire(
   new URL("../../x402-facilitator/package.json", import.meta.url),
@@ -194,28 +198,30 @@ try {
         stdio: "ignore",
       }),
     );
-  await waitFor(
-    liveFuji
-      ? "http://127.0.0.1:4030/health/live"
-      : "http://127.0.0.1:4130/health/live",
-  );
-  children.push(
-    spawn(process.execPath, ["dist/server.js"], {
-      env: {
-        ...process.env,
-        FACET_DEMO_X402_ENABLED: liveFuji ? "1" : "0",
-        FACET_GATEWAY_PORT: "4120",
-        FACET_EXECUTOR_URL: liveFuji
-          ? "http://127.0.0.1:4030"
-          : "http://127.0.0.1:4130",
-        FACET_EXECUTOR_TOKEN: liveFuji
-          ? process.env.FACET_EXECUTOR_TOKEN
-          : executorToken,
-      },
-      stdio: "ignore",
-    }),
-  );
-  await waitFor("http://127.0.0.1:4120/health/live");
+  if (!deployedGatewayUrl) {
+    await waitFor(
+      liveFuji
+        ? "http://127.0.0.1:4030/health/live"
+        : "http://127.0.0.1:4130/health/live",
+    );
+    children.push(
+      spawn(process.execPath, ["dist/server.js"], {
+        env: {
+          ...process.env,
+          FACET_DEMO_X402_ENABLED: liveFuji ? "1" : "0",
+          FACET_GATEWAY_PORT: "4120",
+          FACET_EXECUTOR_URL: liveFuji
+            ? "http://127.0.0.1:4030"
+            : "http://127.0.0.1:4130",
+          FACET_EXECUTOR_TOKEN: liveFuji
+            ? process.env.FACET_EXECUTOR_TOKEN
+            : executorToken,
+        },
+        stdio: "ignore",
+      }),
+    );
+  }
+  await waitFor(`${gatewayUrl}/health/live`);
 
   const inputs = [
     { version: ids.actorVersion, input: { value: 7 }, expected: 1 },
@@ -248,7 +254,7 @@ try {
   for (const { version, input, expected } of inputs) {
     const key = randomUUID();
     const invoke = (signature?: string) =>
-      fetch(`http://127.0.0.1:4120/v1/facet-versions/${version}/invoke`, {
+      fetch(`${gatewayUrl}/v1/facet-versions/${version}/invoke`, {
         method: "POST",
         headers: {
           "content-type": "application/json",
