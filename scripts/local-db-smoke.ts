@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
+import { createRequire } from "node:module";
 import { loadEnvFile } from "node:process";
 import { setTimeout as delay } from "node:timers/promises";
 import { Pool } from "pg";
@@ -26,7 +27,12 @@ const facetId = randomUUID(),
 const unique = randomUUID().slice(0, 8);
 const baseUrl = `http://127.0.0.1:${process.env.FACET_GATEWAY_PORT ?? "4020"}`;
 let child: ReturnType<typeof spawn> | undefined;
-const paidMode = process.env.FACET_PAID_SMOKE === "1";
+const liveFuji = process.env.FACET_LIVE_FUJI_API_SMOKE === "1";
+if (liveFuji) loadEnvFile("../mcp-server/.env");
+const facilitatorRequire = createRequire(
+  new URL("../../x402-facilitator/package.json", import.meta.url),
+);
+const paidMode = process.env.FACET_PAID_SMOKE === "1" || liveFuji;
 const contractMode = process.env.FACET_CONTRACT_SMOKE === "1";
 const pendingReceiptMode = process.env.FACET_PENDING_RECEIPT_SMOKE === "1";
 const payTo = "0x0000000000000000000000000000000000000001";
@@ -219,7 +225,7 @@ try {
       [versionId, payTo],
     );
 
-  if (paidMode) {
+  if (paidMode && !liveFuji) {
     await new Promise<void>((resolve) =>
       fakeFacilitator.listen(4023, "127.0.0.1", resolve),
     );
@@ -232,16 +238,28 @@ try {
     env: {
       ...process.env,
       FACET_DEMO_X402_ENABLED: paidMode ? "1" : "0",
-      FACET_FACILITATOR_URL: "http://127.0.0.1:4023",
-      FACET_FACILITATOR_TOKEN: facilitatorToken,
-      FACET_EXECUTOR_TOKEN: executorToken,
-      FACET_EXECUTOR_URL: "http://127.0.0.1:4033",
-      FACET_DEMO_PAY_TO: payTo,
+      FACET_FACILITATOR_URL: liveFuji
+        ? "http://127.0.0.1:4022"
+        : "http://127.0.0.1:4023",
+      FACET_FACILITATOR_TOKEN: liveFuji
+        ? process.env.FACET_FACILITATOR_TOKEN
+        : facilitatorToken,
+      FACET_EXECUTOR_TOKEN: liveFuji
+        ? process.env.FACET_EXECUTOR_TOKEN
+        : executorToken,
+      FACET_EXECUTOR_URL: liveFuji
+        ? "http://127.0.0.1:4030"
+        : "http://127.0.0.1:4033",
+      FACET_DEMO_PAY_TO: liveFuji ? process.env.FACET_DEMO_PAY_TO : payTo,
       FACET_DEMO_AMOUNT_ATOMIC: "1000",
-      FACET_FEE_SPLIT_ADDRESS: contractMode
-        ? "0x0000000000000000000000000000000000000004"
-        : "",
-      FACET_RECEIPT_LOG_ADDRESS: "0x0000000000000000000000000000000000000005",
+      FACET_FEE_SPLIT_ADDRESS: liveFuji
+        ? process.env.FACET_FEE_SPLIT_ADDRESS
+        : contractMode
+          ? "0x0000000000000000000000000000000000000004"
+          : "",
+      FACET_RECEIPT_LOG_ADDRESS: liveFuji
+        ? process.env.FACET_RECEIPT_LOG_ADDRESS
+        : "0x0000000000000000000000000000000000000005",
     },
     stdio: "ignore",
   });
@@ -280,16 +298,40 @@ try {
     const challenge = decodePaymentRequiredHeader(
       first.headers.get("PAYMENT-REQUIRED")!,
     );
-    signature = encodePaymentSignatureHeader({
-      x402Version: 2,
-      resource: challenge.resource,
-      accepted: challenge.accepts[0]!,
-      payload: { authorization: { nonce: `0x${"2".repeat(64)}` } },
-    });
+    if (liveFuji) {
+      const { ExactEvmScheme } = facilitatorRequire("@x402/evm/exact/client");
+      const { privateKeyToAccount } = facilitatorRequire("viem/accounts");
+      const payer = privateKeyToAccount(
+        process.env.FACET_DEMO_PAYER_PRIVATE_KEY,
+      );
+      const signed = await new ExactEvmScheme({
+        address: payer.address,
+        signTypedData: (args: unknown) => payer.signTypedData(args),
+      }).createPaymentPayload(2, challenge.accepts[0]);
+      signature = encodePaymentSignatureHeader({
+        x402Version: 2,
+        resource: challenge.resource,
+        accepted: challenge.accepts[0]!,
+        payload: signed.payload,
+      });
+    } else
+      signature = encodePaymentSignatureHeader({
+        x402Version: 2,
+        resource: challenge.resource,
+        accepted: challenge.accepts[0]!,
+        payload: { authorization: { nonce: `0x${"2".repeat(64)}` } },
+      });
     first = await invoke(
       { path: { owner: "octocat", repo: "Hello-World" } },
       signature,
     );
+    if (liveFuji)
+      for (let attempt = 0; first.status === 202 && attempt < 8; attempt++) {
+        await delay(1500);
+        first = await invoke({
+          path: { owner: "octocat", repo: "Hello-World" },
+        });
+      }
   }
   if (pendingReceiptMode) {
     if (first.status !== 202)
@@ -301,6 +343,7 @@ try {
       `First invocation failed: ${first.status} ${await first.text()}`,
     );
   const firstBody = (await first.json()) as {
+    runId: string;
     result: { full_name: string };
     replayed: boolean;
     receipt?: {
@@ -339,22 +382,32 @@ try {
   if (conflict.status !== 409)
     throw new Error("Changed-input idempotency conflict was not rejected");
   if (paidMode) {
-    if (
-      verifyCount !== 1 ||
-      settleCount !== (contractMode ? 0 : 1) ||
-      depositCount !== (contractMode ? 1 : 0) ||
-      settleResultCount !== (contractMode ? 1 : 0) ||
-      signCount !== 1 ||
-      receiptCount !== (pendingReceiptMode ? 2 : 1)
-    )
-      throw new Error("Paid replay repeated verification or settlement");
-    const reusedPayment = await invoke(
-      { path: { owner: "octocat", repo: "Hello-World" } },
-      signature,
-      randomUUID(),
-    );
-    if (reusedPayment.status !== 409)
-      throw new Error("Payment signature was reused for another Run");
+    if (liveFuji) {
+      process.stdout.write(
+        JSON.stringify({
+          runId: firstBody.runId,
+          paymentTxHash: firstBody.receipt?.paymentTxHash,
+          receiptTxHash: firstBody.receipt?.receiptTxHash,
+        }) + "\n",
+      );
+    } else {
+      if (
+        verifyCount !== 1 ||
+        settleCount !== (contractMode ? 0 : 1) ||
+        depositCount !== (contractMode ? 1 : 0) ||
+        settleResultCount !== (contractMode ? 1 : 0) ||
+        signCount !== 1 ||
+        receiptCount !== (pendingReceiptMode ? 2 : 1)
+      )
+        throw new Error("Paid replay repeated verification or settlement");
+      const reusedPayment = await invoke(
+        { path: { owner: "octocat", repo: "Hello-World" } },
+        signature,
+        randomUUID(),
+      );
+      if (reusedPayment.status !== 409)
+        throw new Error("Payment signature was reused for another Run");
+    }
   }
   if (contractMode) {
     const missingInput = {
@@ -397,11 +450,11 @@ try {
       throw new Error("Refund state was not persisted");
   }
   process.stdout.write(
-    `Gateway PostgreSQL + real GitHub ${paidMode ? "mock-facilitator paid " : ""}invocation, replay and conflict passed.\n`,
+    `Gateway PostgreSQL + real GitHub ${liveFuji ? "Fuji paid " : paidMode ? "mock-facilitator paid " : ""}invocation, replay and conflict passed.\n`,
   );
 } finally {
   child?.kill("SIGTERM");
-  if (paidMode) {
+  if (paidMode && !liveFuji) {
     await new Promise<void>((resolve) =>
       fakeFacilitator.close(() => resolve()),
     );

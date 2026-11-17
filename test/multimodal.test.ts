@@ -62,6 +62,18 @@ describe("multi-modal gateway planning", () => {
     ).toThrow("FEE_SPLIT_CONTRACT_REQUIRED");
   });
 
+  it("routes per-run API payments through the fee contract when configured", () => {
+    const api = {
+      ...facet,
+      facetType: "external_http_api" as const,
+      pricingModel: "PAY_PER_RUN" as const,
+    };
+    const feeContract = "0x0000000000000000000000000000000000000002";
+    expect(quoteVersion(api, feeContract, 100000n).payTo).toBe(feeContract);
+    expect(quoteVersion(api, undefined, 100000n).payTo).toBe(facet.payTo);
+    expect(quoteVersion(api, "", 100000n).payTo).toBe(facet.payTo);
+  });
+
   it("builds a version-pinned Actor request without endpoint configuration", () => {
     expect(
       buildExecutorRequest(facet, "019a1234-5678-7abc-8def-123456789abe", {

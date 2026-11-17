@@ -16,6 +16,7 @@
     "db:smoke:receipt-pending": "FACET_PAID_SMOKE=1 FACET_PENDING_RECEIPT_SMOKE=1 tsx scripts/local-db-smoke.ts",
     "db:smoke:multimodal": "tsx scripts/multimodal-db-smoke.ts",
     "db:smoke:fuji": "FACET_LIVE_FUJI_SMOKE=1 tsx scripts/multimodal-db-smoke.ts",
+    "db:smoke:fuji-api": "FACET_LIVE_FUJI_API_SMOKE=1 tsx scripts/local-db-smoke.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "format": "prettier --write src test scripts package.json tsconfig.json",
