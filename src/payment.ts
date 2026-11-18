@@ -110,6 +110,26 @@ export function decodeAndCheckPayment(
   return payload;
 }
 
+export function verifiedPaymentPayer(
+  payload: PaymentPayload,
+  verified: VerifyResponse,
+): string {
+  const raw = payload.payload as Record<string, unknown>;
+  const authorization = raw.authorization as
+    Record<string, unknown> | undefined;
+  const payer = verified.payer;
+  if (
+    !verified.isValid ||
+    typeof payer !== "string" ||
+    !/^0x[a-f0-9]{40}$/iu.test(payer) ||
+    typeof authorization?.from !== "string" ||
+    authorization.from.toLowerCase() !== payer.toLowerCase()
+  ) {
+    throw new Error("PAYMENT_PAYER_INVALID");
+  }
+  return payer.toLowerCase();
+}
+
 async function facilitatorCall<T>(
   config: DemoPaymentConfig,
   operation: "verify" | "settle",

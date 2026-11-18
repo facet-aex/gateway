@@ -288,7 +288,7 @@ try {
       first = await invoke(signature);
       for (let attempt = 0; first.status === 202 && attempt < 8; attempt++) {
         await delay(1500);
-        first = await invoke();
+        first = await invoke(signature);
       }
     }
     if (first.status !== 200)

@@ -7,6 +7,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { Pool } from "pg";
 import { canonicalJson } from "../src/canonical.js";
 import {
+  decodePaymentSignatureHeader,
   decodePaymentRequiredHeader,
   encodePaymentSignatureHeader,
 } from "@x402/core/http";
@@ -52,6 +53,7 @@ let verifyCount = 0,
   settleResultCount = 0,
   refundCount = 0;
 let rejectNextDeposit = false;
+let fakeVerifiedPayer = "0x0000000000000000000000000000000000000002";
 const fakeFacilitator = createServer((request, response) => {
   if (request.headers["x-facet-facilitator-token"] !== facilitatorToken) {
     response.writeHead(401).end();
@@ -63,7 +65,7 @@ const fakeFacilitator = createServer((request, response) => {
     response.end(
       JSON.stringify({
         isValid: true,
-        payer: "0x0000000000000000000000000000000000000002",
+        payer: fakeVerifiedPayer,
       }),
     );
     return;
@@ -334,7 +336,12 @@ try {
         x402Version: 2,
         resource: challenge.resource,
         accepted: challenge.accepts[0]!,
-        payload: { authorization: { nonce: `0x${"2".repeat(64)}` } },
+        payload: {
+          authorization: {
+            from: "0x0000000000000000000000000000000000000002",
+            nonce: `0x${"2".repeat(64)}`,
+          },
+        },
       });
     first = await invoke(
       { path: { owner: "octocat", repo: "Hello-World" } },
@@ -343,15 +350,21 @@ try {
     if (liveFuji)
       for (let attempt = 0; first.status === 202 && attempt < 8; attempt++) {
         await delay(1500);
-        first = await invoke({
-          path: { owner: "octocat", repo: "Hello-World" },
-        });
+        first = await invoke(
+          {
+            path: { owner: "octocat", repo: "Hello-World" },
+          },
+          signature,
+        );
       }
   }
   if (pendingReceiptMode) {
     if (first.status !== 202)
       throw new Error("Pending receipt was reported as settled");
-    first = await invoke({ path: { owner: "octocat", repo: "Hello-World" } });
+    first = await invoke(
+      { path: { owner: "octocat", repo: "Hello-World" } },
+      signature,
+    );
   }
   if (first.status !== 200)
     throw new Error(
@@ -361,6 +374,12 @@ try {
     runId: string;
     result: { full_name: string };
     replayed: boolean;
+    payment?: {
+      amountAtomic: string;
+      payer: string;
+      creatorPayTo: string;
+      transaction: string;
+    };
     receipt?: {
       inputHash: string;
       outputHash: string;
@@ -385,15 +404,33 @@ try {
       !firstBody.receipt.runnerSignature)
   )
     throw new Error("Paid response omitted receipt proof");
-  const replay = await invoke({
-    path: { repo: "Hello-World", owner: "octocat" },
-  });
+  if (
+    paidMode &&
+    (!firstBody.payment ||
+      firstBody.payment.amountAtomic !== "1000" ||
+      firstBody.payment.creatorPayTo.toLowerCase() !== payTo ||
+      !/^0x[a-f0-9]{40}$/iu.test(firstBody.payment.payer) ||
+      (!liveFuji &&
+        firstBody.payment.payer.toLowerCase() !==
+          "0x0000000000000000000000000000000000000002"))
+  ) {
+    throw new Error("Paid response omitted verified payment terms");
+  }
+  const replay = await invoke(
+    {
+      path: { repo: "Hello-World", owner: "octocat" },
+    },
+    signature,
+  );
   const replayBody = (await replay.json()) as { replayed: boolean };
   if (replay.status !== 200 || !replayBody.replayed)
     throw new Error("Same-key replay did not return cached result");
-  const conflict = await invoke({
-    path: { owner: "octocat", repo: "Spoon-Knife" },
-  });
+  const conflict = await invoke(
+    {
+      path: { owner: "octocat", repo: "Spoon-Knife" },
+    },
+    signature,
+  );
   if (conflict.status !== 409)
     throw new Error("Changed-input idempotency conflict was not rejected");
   if (paidMode) {
@@ -422,6 +459,52 @@ try {
       );
       if (reusedPayment.status !== 409)
         throw new Error("Payment signature was reused for another Run");
+      if (!contractMode && !pendingReceiptMode) {
+        const challengeResponse = await invoke({
+          path: { owner: "octocat", repo: "Hello-World" },
+        });
+        const challenge = decodePaymentRequiredHeader(
+          challengeResponse.headers.get("PAYMENT-REQUIRED")!,
+        );
+        fakeVerifiedPayer = "0x0000000000000000000000000000000000000003";
+        const secondSignature = encodePaymentSignatureHeader({
+          x402Version: 2,
+          resource: challenge.resource,
+          accepted: challenge.accepts[0]!,
+          payload: {
+            authorization: {
+              from: fakeVerifiedPayer,
+              nonce: `0x${"3".repeat(64)}`,
+            },
+          },
+        });
+        const second = await invoke(
+          { path: { owner: "octocat", repo: "Hello-World" } },
+          secondSignature,
+        );
+        if (second.status !== 200)
+          throw new Error(
+            `Second payer failed: ${second.status} ${await second.text()}`,
+          );
+        const secondBody = (await second.json()) as {
+          runId: string;
+          replayed: boolean;
+        };
+        if (secondBody.runId === firstBody.runId || secondBody.replayed)
+          throw new Error("Different payers shared a Run");
+        const payerRows = await pool.query<{ caller_id: string }>(
+          "SELECT caller_id FROM facet_demo_runs WHERE id IN ($1,$2) ORDER BY caller_id",
+          [firstBody.runId, secondBody.runId],
+        );
+        if (
+          payerRows.rows.map((row) => row.caller_id).join(",") !==
+          "0x0000000000000000000000000000000000000002,0x0000000000000000000000000000000000000003"
+        ) {
+          throw new Error(
+            "Verified payer was not persisted as caller identity",
+          );
+        }
+      }
     }
   }
   if (contractMode) {
@@ -439,7 +522,12 @@ try {
       x402Version: 2,
       resource: challenge.resource,
       accepted: challenge.accepts[0]!,
-      payload: { authorization: { nonce: `0x${"7".repeat(64)}` } },
+      payload: {
+        authorization: {
+          from: fakeVerifiedPayer,
+          nonce: `0x${"7".repeat(64)}`,
+        },
+      },
     });
     const failedResponse = await invoke(
       missingInput,
@@ -469,11 +557,42 @@ try {
     const staleFingerprint = createHash("sha256")
       .update(canonicalJson(staleInput))
       .digest("hex");
-    await pool.query(
-      "INSERT INTO facet_demo_runs(id,caller_id,facet_version_id,idempotency_key,request_fingerprint,status,payment_state,updated_at) VALUES($1,'local-demo-agent',$2,$3,$4,'EXECUTING','ESCROW_LOCKED',now()-interval '60 seconds')",
-      [staleRunId, versionId, staleKey, staleFingerprint],
+    const staleChallengeResponse = await invoke(
+      staleInput,
+      undefined,
+      staleKey,
     );
-    const staleResponse = await invoke(staleInput, undefined, staleKey);
+    const staleChallenge = decodePaymentRequiredHeader(
+      staleChallengeResponse.headers.get("PAYMENT-REQUIRED")!,
+    );
+    const staleSignature = encodePaymentSignatureHeader({
+      x402Version: 2,
+      resource: staleChallenge.resource,
+      accepted: staleChallenge.accepts[0]!,
+      payload: {
+        authorization: {
+          from: fakeVerifiedPayer,
+          nonce: `0x${"9".repeat(64)}`,
+        },
+      },
+    });
+    const stalePayload = decodePaymentSignatureHeader(staleSignature);
+    const staleHash = createHash("sha256")
+      .update(canonicalJson(stalePayload))
+      .digest("hex");
+    await pool.query(
+      "INSERT INTO facet_demo_runs(id,caller_id,facet_version_id,idempotency_key,request_fingerprint,status,payment_state,payment_payload,payment_payload_hash,updated_at) VALUES($1,$2,$3,$4,$5,'EXECUTING','ESCROW_LOCKED',$6::jsonb,$7,now()-interval '60 seconds')",
+      [
+        staleRunId,
+        fakeVerifiedPayer,
+        versionId,
+        staleKey,
+        staleFingerprint,
+        JSON.stringify(stalePayload),
+        staleHash,
+      ],
+    );
+    const staleResponse = await invoke(staleInput, staleSignature, staleKey);
     const recovered = await pool.query(
       "SELECT status,payment_state FROM facet_demo_runs WHERE id=$1",
       [staleRunId],
@@ -502,7 +621,12 @@ try {
       x402Version: 2,
       resource: rejectChallenge.resource,
       accepted: rejectChallenge.accepts[0]!,
-      payload: { authorization: { nonce: `0x${"8".repeat(64)}` } },
+      payload: {
+        authorization: {
+          from: fakeVerifiedPayer,
+          nonce: `0x${"8".repeat(64)}`,
+        },
+      },
     });
     const rejectResponse = await invoke(
       rejectInput,

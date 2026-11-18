@@ -10,6 +10,7 @@ import {
   readPaymentConfig,
   contractPaymentCall,
   recordReceiptCall,
+  verifiedPaymentPayer,
   type DemoPaymentConfig,
 } from "../src/payment.js";
 
@@ -23,6 +24,38 @@ const versionId = "00000000-0000-4000-8000-000000000001";
 const fingerprint = "a".repeat(64);
 
 describe("Gateway x402 challenge", () => {
+  it("uses only a facilitator-verified payer matching the authorization", () => {
+    const payload = {
+      x402Version: 2,
+      resource: {
+        url: "https://facet.example/invoke",
+        description: "run",
+        mimeType: "application/json",
+      },
+      accepted: requirements(config),
+      payload: {
+        authorization: { from: "0x0000000000000000000000000000000000000002" },
+      },
+    };
+    expect(
+      verifiedPaymentPayer(payload, {
+        isValid: true,
+        payer: "0x0000000000000000000000000000000000000002",
+      }),
+    ).toBe("0x0000000000000000000000000000000000000002");
+    expect(() =>
+      verifiedPaymentPayer(payload, {
+        isValid: true,
+        payer: "0x0000000000000000000000000000000000000003",
+      }),
+    ).toThrow("PAYMENT_PAYER_INVALID");
+    expect(() =>
+      verifiedPaymentPayer(payload, {
+        isValid: false,
+        payer: "0x0000000000000000000000000000000000000002",
+      }),
+    ).toThrow("PAYMENT_PAYER_INVALID");
+  });
   it("sends contract phases only to authenticated internal facilitator", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(

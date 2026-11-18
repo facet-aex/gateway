@@ -3,7 +3,10 @@ import { loadEnvFile } from "node:process";
 import Fastify from "fastify";
 import { Pool } from "pg";
 import type { PaymentPayload } from "@x402/core/types";
-import { encodePaymentResponseHeader } from "@x402/core/http";
+import {
+  decodePaymentSignatureHeader,
+  encodePaymentResponseHeader,
+} from "@x402/core/http";
 import {
   decodeAndCheckPayment,
   contractPaymentCall,
@@ -12,6 +15,7 @@ import {
   readPaymentConfig,
   recordReceiptCall,
   settlePayment,
+  verifiedPaymentPayer,
   verifyPayment,
 } from "./payment.js";
 import {
@@ -66,6 +70,29 @@ type PaidQuote = {
   creatorPayTo: string;
 };
 
+function paidMetadata(
+  quote: PaidQuote,
+  payer: string,
+  transaction: string,
+  config: ContextRow,
+  run: RunRow,
+) {
+  const amountAtomic =
+    quote.pricingModel === "PAY_PER_RESULT"
+      ? (
+          BigInt(config.priceAtomic) * BigInt(usageProof(run).itemCount)
+        ).toString()
+      : quote.amount;
+  return {
+    transaction,
+    network: "eip155:43113" as const,
+    amountAtomic,
+    payer,
+    creatorPayTo: quote.creatorPayTo,
+    payTo: quote.payTo,
+  };
+}
+
 function usageProof(run: RunRow) {
   const usage = run.usage_meta;
   if (
@@ -80,7 +107,7 @@ function usageProof(run: RunRow) {
   return {
     inputHash: `sha256:${run.request_fingerprint}`,
     outputHash: usage.outputHash,
-    itemCount: usage.itemCount,
+    itemCount: Number(usage.itemCount),
     runnerSignature: usage.runnerSignature,
   };
 }
@@ -89,6 +116,7 @@ async function settleRun(
   run: RunRow,
   config: ContextRow,
   quote: PaidQuote,
+  payer: string,
   reply: import("fastify").FastifyReply,
 ) {
   if (!paymentConfig || !run.payment_payload)
@@ -207,7 +235,7 @@ async function settleRun(
       dataset: run.dataset ?? [],
       usage: run.usage_meta ?? undefined,
       replayed: false,
-      payment: { transaction: paymentTxHash, network: "eip155:43113" },
+      payment: paidMetadata(quote, payer, paymentTxHash, config, run),
       receipt: { ...proof, paymentTxHash, receiptTxHash },
     };
   } catch {
@@ -274,7 +302,85 @@ app.post<{ Params: { versionId: string }; Body: { input?: unknown } }>(
           .send({ error: { code: (error as Error).message } });
       }
     }
-    const callerId = "local-demo-agent";
+    const signature = request.headers["payment-signature"];
+    if (paymentConfig && typeof signature !== "string") {
+      const challenge = paymentChallenge(
+        paymentConfig,
+        versionId,
+        fingerprint,
+        quote,
+      );
+      reply.header("PAYMENT-REQUIRED", challenge.header);
+      return reply.code(402).send(challenge.body);
+    }
+    let paymentPayload: PaymentPayload | undefined;
+    let paymentPayloadHash: string | null = null;
+    let callerId = "local-demo-agent";
+    if (paymentConfig) {
+      try {
+        paymentPayload = decodePaymentSignatureHeader(signature as string);
+        paymentPayloadHash = createHash("sha256")
+          .update(canonicalJson(paymentPayload))
+          .digest("hex");
+      } catch {
+        return reply
+          .code(400)
+          .send({ error: { code: "PAYMENT_SIGNATURE_INVALID" } });
+      }
+      const known = await pool.query<{
+        caller_id: string;
+        facet_version_id: string;
+        idempotency_key: string;
+        request_fingerprint: string;
+        payment_state: string;
+      }>(
+        `SELECT caller_id, facet_version_id, idempotency_key, request_fingerprint, payment_state
+           FROM facet_demo_runs WHERE payment_payload_hash=$1`,
+        [paymentPayloadHash],
+      );
+      const previous = known.rows[0];
+      if (previous) {
+        if (
+          previous.facet_version_id !== versionId ||
+          previous.idempotency_key !== key ||
+          previous.payment_state === "FAILED"
+        ) {
+          return reply
+            .code(409)
+            .send({ error: { code: "PAYMENT_REPLAY_CONFLICT" } });
+        }
+        if (previous.request_fingerprint !== fingerprint)
+          return reply
+            .code(409)
+            .send({ error: { code: "IDEMPOTENCY_CONFLICT" } });
+        callerId = previous.caller_id;
+      }
+      try {
+        paymentPayload = decodeAndCheckPayment(
+          signature as string,
+          paymentConfig,
+          versionId,
+          fingerprint,
+          quote,
+        );
+      } catch {
+        return reply
+          .code(400)
+          .send({ error: { code: "PAYMENT_SIGNATURE_INVALID" } });
+      }
+      if (!previous) {
+        try {
+          const verified = await verifyPayment(
+            paymentConfig,
+            paymentPayload!,
+            quote,
+          );
+          callerId = verifiedPaymentPayer(paymentPayload!, verified);
+        } catch {
+          return reply.code(402).send({ error: { code: "PAYMENT_INVALID" } });
+        }
+      }
+    }
     let resumedRun: RunRow | undefined;
     const existing = await pool.query<RunRow>(
       `SELECT id, request_fingerprint, status, result, dataset, usage_meta, receipt_tx_hash, error_code, payment_state, payment_payload, payment_tx_hash FROM facet_demo_runs WHERE caller_id=$1 AND facet_version_id=$2 AND idempotency_key=$3`,
@@ -294,16 +400,25 @@ app.post<{ Params: { versionId: string }; Body: { input?: unknown } }>(
         return {
           runId: run.id,
           facetVersionId: versionId,
+          facetType: config.facetType.toUpperCase(),
           result: run.result,
           dataset: run.dataset ?? [],
           usage: run.usage_meta ?? undefined,
           replayed: true,
           ...(run.payment_tx_hash
             ? {
-                payment: {
-                  transaction: run.payment_tx_hash,
-                  network: "eip155:43113",
-                },
+                payment: quote
+                  ? paidMetadata(
+                      quote,
+                      callerId,
+                      run.payment_tx_hash,
+                      config,
+                      run,
+                    )
+                  : {
+                      transaction: run.payment_tx_hash,
+                      network: "eip155:43113",
+                    },
               }
             : {}),
           ...(run.receipt_tx_hash && run.payment_tx_hash
@@ -321,7 +436,7 @@ app.post<{ Params: { versionId: string }; Body: { input?: unknown } }>(
         paymentConfig &&
         ["VERIFIED", "PENDING", "SETTLING"].includes(run.payment_state)
       )
-        return settleRun(run, config, quote!, reply);
+        return settleRun(run, config, quote!, callerId, reply);
       if (
         run.status === "SUCCEEDED" &&
         run.payment_state === "SETTLED" &&
@@ -424,34 +539,7 @@ app.post<{ Params: { versionId: string }; Body: { input?: unknown } }>(
           runId: run.id,
         });
     }
-    const signature = request.headers["payment-signature"];
-    if (paymentConfig && !resumedRun && typeof signature !== "string") {
-      const challenge = paymentChallenge(
-        paymentConfig,
-        versionId,
-        fingerprint,
-        quote,
-      );
-      reply.header("PAYMENT-REQUIRED", challenge.header);
-      return reply.code(402).send(challenge.body);
-    }
-    let paymentPayload: PaymentPayload | undefined =
-      resumedRun?.payment_payload ?? undefined;
-    if (paymentConfig && !resumedRun) {
-      try {
-        paymentPayload = decodeAndCheckPayment(
-          signature as string,
-          paymentConfig,
-          versionId,
-          fingerprint,
-          quote,
-        );
-      } catch {
-        return reply
-          .code(400)
-          .send({ error: { code: "PAYMENT_SIGNATURE_INVALID" } });
-      }
-    }
+    paymentPayload = resumedRun?.payment_payload ?? paymentPayload;
     let inserted: { rows: RunRow[] };
     try {
       inserted = resumedRun
@@ -465,13 +553,9 @@ app.post<{ Params: { versionId: string }; Body: { input?: unknown } }>(
               key,
               fingerprint,
               config.facetType,
-              paymentConfig ? "QUOTED" : "NOT_REQUIRED",
+              paymentConfig ? "VERIFIED" : "NOT_REQUIRED",
               paymentPayload ? JSON.stringify(paymentPayload) : null,
-              paymentPayload
-                ? createHash("sha256")
-                    .update(canonicalJson(paymentPayload))
-                    .digest("hex")
-                : null,
+              paymentPayloadHash,
             ],
           );
     } catch (error) {
@@ -501,7 +585,7 @@ app.post<{ Params: { versionId: string }; Body: { input?: unknown } }>(
           paymentConfig &&
           ["VERIFIED", "PENDING", "SETTLING"].includes(run.payment_state)
         )
-          return settleRun(run, config, quote!, reply);
+          return settleRun(run, config, quote!, callerId, reply);
         if (
           paymentConfig &&
           (run.payment_state !== "SETTLED" || !run.receipt_tx_hash)
@@ -512,16 +596,25 @@ app.post<{ Params: { versionId: string }; Body: { input?: unknown } }>(
         return {
           runId: run.id,
           facetVersionId: versionId,
+          facetType: config.facetType.toUpperCase(),
           result: run.result,
           dataset: run.dataset ?? [],
           usage: run.usage_meta ?? undefined,
           replayed: true,
           ...(run.payment_tx_hash
             ? {
-                payment: {
-                  transaction: run.payment_tx_hash,
-                  network: "eip155:43113",
-                },
+                payment: quote
+                  ? paidMetadata(
+                      quote,
+                      callerId,
+                      run.payment_tx_hash,
+                      config,
+                      run,
+                    )
+                  : {
+                      transaction: run.payment_tx_hash,
+                      network: "eip155:43113",
+                    },
               }
             : {}),
           ...(run.receipt_tx_hash && run.payment_tx_hash
@@ -546,39 +639,6 @@ app.post<{ Params: { versionId: string }; Body: { input?: unknown } }>(
       });
     }
     const runId = inserted.rows[0].id;
-    if (paymentConfig && paymentPayload && !resumedRun) {
-      try {
-        const verified = await verifyPayment(
-          paymentConfig,
-          paymentPayload,
-          quote,
-        );
-        if (!verified.isValid) {
-          await pool.query(
-            "UPDATE facet_demo_runs SET status='FAILED', payment_state='FAILED', error_code='PAYMENT_INVALID' WHERE id=$1",
-            [runId],
-          );
-          return reply.code(402).send({
-            error: {
-              code: "PAYMENT_INVALID",
-              reason: verified.invalidReason,
-            },
-          });
-        }
-        await pool.query(
-          "UPDATE facet_demo_runs SET payment_state='VERIFIED', updated_at=now() WHERE id=$1",
-          [runId],
-        );
-      } catch {
-        await pool.query(
-          "UPDATE facet_demo_runs SET status='FAILED', payment_state='FAILED', error_code='PAYMENT_VERIFY_FAILED' WHERE id=$1",
-          [runId],
-        );
-        return reply
-          .code(502)
-          .send({ error: { code: "PAYMENT_VERIFY_FAILED" } });
-      }
-    }
     if (
       paymentConfig &&
       paymentPayload &&
@@ -697,6 +757,7 @@ app.post<{ Params: { versionId: string }; Body: { input?: unknown } }>(
           },
           config,
           quote!,
+          callerId,
           reply,
         );
       return {
