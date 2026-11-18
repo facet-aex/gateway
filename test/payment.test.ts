@@ -154,6 +154,19 @@ describe("Gateway x402 challenge", () => {
     );
     expect(challenge.body.accepts).toEqual([requirements(config)]);
   });
+  it("uses the public HTTPS origin for a production payment resource", () => {
+    const previous = { ...process.env };
+    try {
+      process.env.FACET_PUBLIC_GATEWAY_ORIGIN = "https://facet.example";
+      expect(
+        paymentChallenge(config, versionId, fingerprint).body.resource.url,
+      ).toBe(
+        `https://facet.example/v1/facet-versions/${versionId}/invoke?fingerprint=${fingerprint}`,
+      );
+    } finally {
+      process.env = previous;
+    }
+  });
 
   it("rejects a signed payload for another resource or amount", () => {
     const challenge = paymentChallenge(config, versionId, fingerprint).body;

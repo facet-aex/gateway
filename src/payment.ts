@@ -26,6 +26,13 @@ const network = "eip155:43113";
 
 export function readPaymentConfig(): DemoPaymentConfig | undefined {
   if (process.env.FACET_DEMO_X402_ENABLED !== "1") return undefined;
+  if (
+    process.env.NODE_ENV === "production" &&
+    (!process.env.FACET_PUBLIC_GATEWAY_ORIGIN ||
+      new URL(process.env.FACET_PUBLIC_GATEWAY_ORIGIN).protocol !== "https:")
+  ) {
+    throw new Error("PUBLIC_GATEWAY_ORIGIN_REQUIRED");
+  }
   const facilitatorUrl = process.env.FACET_FACILITATOR_URL;
   const facilitatorToken = process.env.FACET_FACILITATOR_TOKEN;
   const payTo = process.env.FACET_DEMO_PAY_TO;
@@ -66,10 +73,20 @@ export function paymentChallenge(
   fingerprint: string,
   quote?: VersionQuote,
 ) {
+  const publicOrigin = process.env.FACET_PUBLIC_GATEWAY_ORIGIN;
+  if (
+    process.env.NODE_ENV === "production" &&
+    (!publicOrigin || new URL(publicOrigin).protocol !== "https:")
+  ) {
+    throw new Error("PUBLIC_GATEWAY_ORIGIN_REQUIRED");
+  }
+  const origin =
+    publicOrigin ??
+    `http://127.0.0.1:${process.env.FACET_GATEWAY_PORT ?? "4020"}`;
   const required: PaymentRequired = {
     x402Version: 2,
     resource: {
-      url: `http://127.0.0.1:${process.env.FACET_GATEWAY_PORT ?? "4020"}/v1/facet-versions/${versionId}/invoke?fingerprint=${fingerprint}`,
+      url: `${new URL(origin).origin}/v1/facet-versions/${versionId}/invoke?fingerprint=${fingerprint}`,
       description: "FACET demo read-only API call",
       mimeType: "application/json",
     },

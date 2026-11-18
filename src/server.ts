@@ -291,7 +291,13 @@ app.post<{ Params: { versionId: string }; Body: { input?: unknown } }>(
     if (paymentConfig) {
       try {
         const perVersion = quoteVersion(
-          { ...config, payTo: config.payTo ?? paymentConfig.payTo },
+          {
+            ...config,
+            payTo:
+              config.facetType === "external_http_api"
+                ? (config.payTo ?? paymentConfig.payTo)
+                : config.payTo,
+          },
           process.env.FACET_FEE_SPLIT_ADDRESS,
           BigInt(process.env.FACET_MAX_PAYMENT_ATOMIC ?? "100000"),
         );
