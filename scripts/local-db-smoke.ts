@@ -20,13 +20,14 @@ try {
 if (!process.env.DATABASE_URL) throw new Error("DATABASE_URL is required");
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 const userId = randomUUID(),
-  providerId = randomUUID(),
   sourceId = randomUUID(),
   sourceVersionId = randomUUID();
 const facetId = randomUUID(),
   versionId = randomUUID(),
   endpointId = randomUUID();
-const unique = randomUUID().slice(0, 8);
+const unique = randomUUID().replace(/-/g, "").slice(0, 6);
+const username = `gw-smk-${unique}`;
+const facetName = `github-repo-${unique}`;
 const liveFuji = process.env.FACET_LIVE_FUJI_API_SMOKE === "1";
 const deployedGatewayUrl = process.env.FACET_DEPLOYED_GATEWAY_URL;
 if (deployedGatewayUrl && !liveFuji)
@@ -167,41 +168,35 @@ async function cleanup() {
     sourceVersionId,
   ]);
   await pool.query("DELETE FROM api_sources WHERE id=$1", [sourceId]);
-  await pool.query("DELETE FROM providers WHERE id=$1", [providerId]);
   await pool.query("DELETE FROM users WHERE id=$1", [userId]);
 }
 
 try {
-  await pool.query("INSERT INTO users (id,external_subject) VALUES ($1,$2)", [
-    userId,
-    `gateway-smoke-${unique}`,
-  ]);
-  await pool.query("INSERT INTO providers (id,slug,name) VALUES ($1,$2,$3)", [
-    providerId,
-    `gateway-smoke-${unique}`,
-    "Gateway smoke provider",
-  ]);
+  await pool.query(
+    "INSERT INTO users (id,clerk_id,username) VALUES ($1,$2,$3)",
+    [userId, `user_gw_${unique}`, username],
+  );
   await pool.query(
     "INSERT INTO api_sources (id,provider_id,name,source_kind) VALUES ($1,$2,$3,'paste')",
-    [sourceId, providerId, "GitHub demo fixture"],
+    [sourceId, userId, "GitHub demo fixture"],
   );
   await pool.query(
     "INSERT INTO api_source_versions (id,api_source_id,object_key,sha256,created_by) VALUES ($1,$2,$3,$4,$5)",
     [sourceVersionId, sourceId, `smoke/${unique}`, "0".repeat(64), userId],
   );
   await pool.query(
-    "INSERT INTO facets (id,provider_id,slug,name,category,status,visibility) VALUES ($1,$2,$3,$4,$5,'published','public')",
+    "INSERT INTO facets (id,provider_id,type,facet_name,facet_display_name,category,status,visibility) VALUES ($1,$2,'API',$3,$4,$5,'published','public')",
     [
       facetId,
-      providerId,
-      `github-repo-${unique}`,
+      userId,
+      facetName,
       "Get public GitHub repository",
       "Developer tools",
     ],
   );
   await pool.query(
     "INSERT INTO endpoint_configs (id,provider_id,protected_base_url,method,path_template,auth_kind,timeout_ms,max_response_bytes,redirect_policy,egress_policy_id) VALUES ($1,$2,'https://api.github.com/','GET','/repos/{owner}/{repo}','none',15000,1048576,'deny','gateway-demo')",
-    [endpointId, providerId],
+    [endpointId, userId],
   );
   const inputSchema = {
     type: "object",
@@ -296,15 +291,18 @@ try {
   if (!ready) throw new Error("Gateway did not start");
   const key = randomUUID();
   const invoke = (input: unknown, signature?: string, overrideKey = key) =>
-    fetch(`${baseUrl}/v1/facet-versions/${versionId}/invoke`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "idempotency-key": overrideKey,
-        ...(signature ? { "PAYMENT-SIGNATURE": signature } : {}),
+    fetch(
+      `${baseUrl}/v1/facets/${username}/${facetName}/versions/0.1.0/invoke`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "idempotency-key": overrideKey,
+          ...(signature ? { "PAYMENT-SIGNATURE": signature } : {}),
+        },
+        body: JSON.stringify({ input }),
       },
-      body: JSON.stringify({ input }),
-    });
+    );
   let first = await invoke({
     path: { owner: "octocat", repo: "Hello-World" },
   });
@@ -377,7 +375,7 @@ try {
     payment?: {
       amountAtomic: string;
       payer: string;
-      creatorPayTo: string;
+      providerPayTo: string;
       transaction: string;
     };
     receipt?: {
@@ -408,7 +406,7 @@ try {
     paidMode &&
     (!firstBody.payment ||
       firstBody.payment.amountAtomic !== "1000" ||
-      firstBody.payment.creatorPayTo.toLowerCase() !== payTo ||
+      firstBody.payment.providerPayTo.toLowerCase() !== payTo ||
       !/^0x[a-f0-9]{40}$/iu.test(firstBody.payment.payer) ||
       (!liveFuji &&
         firstBody.payment.payer.toLowerCase() !==

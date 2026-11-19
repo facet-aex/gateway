@@ -12,6 +12,7 @@ import {
   recordReceiptCall,
   verifiedPaymentPayer,
   type DemoPaymentConfig,
+  type FacetVersionRef,
 } from "../src/payment.js";
 
 const config: DemoPaymentConfig = {
@@ -21,6 +22,11 @@ const config: DemoPaymentConfig = {
   amount: "1000",
 };
 const versionId = "00000000-0000-4000-8000-000000000001";
+const target: FacetVersionRef = {
+  provider: "alice-labs",
+  facetName: "vn-gold-fx-actor",
+  version: "1.0.0",
+};
 const fingerprint = "a".repeat(64);
 
 describe("Gateway x402 challenge", () => {
@@ -126,7 +132,7 @@ describe("Gateway x402 challenge", () => {
       amount: "10000",
       payTo: "0x0000000000000000000000000000000000000002",
     };
-    const challenge = paymentChallenge(config, versionId, fingerprint, quote);
+    const challenge = paymentChallenge(config, target, fingerprint, quote);
     expect(challenge.body.accepts[0]).toMatchObject(quote);
     const payload = {
       x402Version: 2,
@@ -138,19 +144,19 @@ describe("Gateway x402 challenge", () => {
       decodeAndCheckPayment(
         encodePaymentSignatureHeader(payload),
         config,
-        versionId,
+        target,
         fingerprint,
         quote,
       ),
     ).toEqual(payload);
   });
-  it("issues one exact Fuji requirement bound to the requested version and input fingerprint", () => {
-    const challenge = paymentChallenge(config, versionId, fingerprint);
+  it("issues one exact Fuji requirement bound to natural Option B route and input fingerprint", () => {
+    const challenge = paymentChallenge(config, target, fingerprint);
     expect(decodePaymentRequiredHeader(challenge.header)).toEqual(
       challenge.body,
     );
     expect(challenge.body.resource.url).toContain(
-      `/${versionId}/invoke?fingerprint=${fingerprint}`,
+      `/v1/facets/alice-labs/vn-gold-fx-actor/versions/1.0.0/invoke?fingerprint=${fingerprint}`,
     );
     expect(challenge.body.accepts).toEqual([requirements(config)]);
   });
@@ -159,9 +165,9 @@ describe("Gateway x402 challenge", () => {
     try {
       process.env.FACET_PUBLIC_GATEWAY_ORIGIN = "https://facet.example";
       expect(
-        paymentChallenge(config, versionId, fingerprint).body.resource.url,
+        paymentChallenge(config, target, fingerprint).body.resource.url,
       ).toBe(
-        `https://facet.example/v1/facet-versions/${versionId}/invoke?fingerprint=${fingerprint}`,
+        `https://facet.example/v1/facets/alice-labs/vn-gold-fx-actor/versions/1.0.0/invoke?fingerprint=${fingerprint}`,
       );
     } finally {
       process.env = previous;
@@ -169,7 +175,7 @@ describe("Gateway x402 challenge", () => {
   });
 
   it("rejects a signed payload for another resource or amount", () => {
-    const challenge = paymentChallenge(config, versionId, fingerprint).body;
+    const challenge = paymentChallenge(config, target, fingerprint).body;
     const payload = {
       x402Version: 2,
       resource: challenge.resource,
@@ -177,11 +183,11 @@ describe("Gateway x402 challenge", () => {
       payload: {},
     };
     const valid = encodePaymentSignatureHeader(payload);
-    expect(
-      decodeAndCheckPayment(valid, config, versionId, fingerprint),
-    ).toEqual(payload);
+    expect(decodeAndCheckPayment(valid, config, target, fingerprint)).toEqual(
+      payload,
+    );
     expect(() =>
-      decodeAndCheckPayment(valid, config, versionId, "b".repeat(64)),
+      decodeAndCheckPayment(valid, config, target, "b".repeat(64)),
     ).toThrow("PAYMENT_REQUIREMENTS_MISMATCH");
     expect(() =>
       decodeAndCheckPayment(
@@ -190,7 +196,7 @@ describe("Gateway x402 challenge", () => {
           accepted: { ...payload.accepted, amount: "2000" },
         }),
         config,
-        versionId,
+        target,
         fingerprint,
       ),
     ).toThrow("PAYMENT_REQUIREMENTS_MISMATCH");

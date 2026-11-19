@@ -27,7 +27,6 @@ const facilitatorRequire = createRequire(
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 const ids = {
   user: randomUUID(),
-  provider: randomUUID(),
   source: randomUUID(),
   sourceVersion: randomUUID(),
   actor: randomUUID(),
@@ -76,23 +75,19 @@ async function cleanup() {
     ids.sourceVersion,
   ]);
   await pool.query("DELETE FROM api_sources WHERE id=$1", [ids.source]);
-  await pool.query("DELETE FROM providers WHERE id=$1", [ids.provider]);
   await pool.query("DELETE FROM users WHERE id=$1", [ids.user]);
 }
 
 try {
-  const unique = randomUUID().slice(0, 8);
-  await pool.query("INSERT INTO users (id,external_subject) VALUES ($1,$2)", [
-    ids.user,
-    `multimodal-${unique}`,
-  ]);
+  const unique = randomUUID().replace(/-/g, "").slice(0, 6);
+  const username = `mm-smk-${unique}`;
   await pool.query(
-    "INSERT INTO providers (id,slug,name) VALUES ($1,$2,'Gateway multimodal smoke')",
-    [ids.provider, `multimodal-${unique}`],
+    "INSERT INTO users (id,clerk_id,username) VALUES ($1,$2,$3)",
+    [ids.user, `user_mm_${unique}`, username],
   );
   await pool.query(
     "INSERT INTO api_sources (id,provider_id,name,source_kind) VALUES ($1,$2,'Actor fixture','paste')",
-    [ids.source, ids.provider],
+    [ids.source, ids.user],
   );
   await pool.query(
     "INSERT INTO api_source_versions (id,api_source_id,object_key,sha256,created_by) VALUES ($1,$2,$3,$4,$5)",
@@ -108,7 +103,8 @@ try {
     {
       id: ids.actor,
       version: ids.actorVersion,
-      type: "hosted_actor",
+      facetName: `smoke-actor-${unique}`,
+      type: "ACTOR",
       code: actorCode,
       digest,
       tokenId: null,
@@ -123,7 +119,8 @@ try {
     {
       id: ids.agent,
       version: ids.agentVersion,
-      type: "autonomous_agent",
+      facetName: `smoke-agent-${unique}`,
+      type: "AGENT",
       code: null,
       digest: null,
       tokenId: "1",
@@ -143,14 +140,8 @@ try {
   ];
   for (const facet of facets) {
     await pool.query(
-      "INSERT INTO facets (id,provider_id,slug,name,category,type,status,visibility) VALUES ($1,$2,$3,$4,'vietnamese-data',$5,'published','public')",
-      [
-        facet.id,
-        ids.provider,
-        `smoke-${facet.type}-${unique}`,
-        facet.type,
-        facet.type,
-      ],
+      "INSERT INTO facets (id,provider_id,facet_name,facet_display_name,category,type,status,visibility) VALUES ($1,$2,$3,$4,'vietnamese-data',$5,'published','public')",
+      [facet.id, ids.user, facet.facetName, facet.type, facet.type],
     );
     await pool.query(
       `INSERT INTO facet_versions (id,facet_id,version,status,source_version_id,source_operation_pointer,manifest,content_hash,endpoint_config_id,operation,input_schema,output_schema,created_by,published_at,actor_code,image_digest,pricing_model,price_atomic,pay_to,erc8004_token_id,erc8004_registry,agent_task_kind) VALUES ($1,$2,'1.0.0','published',$3,$4,$5::jsonb,$6,NULL,$7::jsonb,$8::jsonb,$9::jsonb,$10,now(),$11,$12,$17,'1000',$13,$14,$15,$16)`,
@@ -173,9 +164,7 @@ try {
         facet.tokenId,
         facet.registry,
         facet.taskKind,
-        liveFuji && facet.type === "hosted_actor"
-          ? "PAY_PER_RESULT"
-          : "PAY_PER_RUN",
+        liveFuji && facet.type === "ACTOR" ? "PAY_PER_RESULT" : "PAY_PER_RUN",
       ],
     );
     await pool.query(
@@ -224,9 +213,15 @@ try {
   await waitFor(`${gatewayUrl}/health/live`);
 
   const inputs = [
-    { version: ids.actorVersion, input: { value: 7 }, expected: 1 },
     {
-      version: ids.agentVersion,
+      facetName: facets[0]!.facetName,
+      version: "1.0.0",
+      input: { value: 7 },
+      expected: 1,
+    },
+    {
+      facetName: facets[1]!.facetName,
+      version: "1.0.0",
       input: {
         question: "Tổng hợp dữ liệu",
         goldQuotes: [
@@ -251,18 +246,21 @@ try {
       expected: 2,
     },
   ];
-  for (const { version, input, expected } of inputs) {
+  for (const { facetName, version, input, expected } of inputs) {
     const key = randomUUID();
     const invoke = (signature?: string) =>
-      fetch(`${gatewayUrl}/v1/facet-versions/${version}/invoke`, {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "idempotency-key": key,
-          ...(signature ? { "PAYMENT-SIGNATURE": signature } : {}),
+      fetch(
+        `${gatewayUrl}/v1/facets/${username}/${facetName}/versions/${version}/invoke`,
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "idempotency-key": key,
+            ...(signature ? { "PAYMENT-SIGNATURE": signature } : {}),
+          },
+          body: JSON.stringify({ input }),
         },
-        body: JSON.stringify({ input }),
-      });
+      );
     let first = await invoke();
     if (liveFuji) {
       if (first.status !== 402)
@@ -341,7 +339,9 @@ try {
     if (liveFuji)
       process.stdout.write(
         JSON.stringify({
-          facetVersionId: version,
+          provider: username,
+          facetName,
+          version,
           runId: body.runId,
           paymentTxHash: body.payment?.transaction,
           receiptTxHash: body.receipt?.receiptTxHash,
