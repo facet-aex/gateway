@@ -14,6 +14,7 @@ try {
     "0001_demo_runs.sql",
     "0002_demo_payments.sql",
     "0003_multimodal_runs.sql",
+    "0004_canonical_facet_types.sql",
   ]) {
     await pool.query(
       await readFile(new URL(`../drizzle/${name}`, import.meta.url), "utf8"),

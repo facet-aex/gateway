@@ -1,7 +1,9 @@
+import type { FacetType } from "./identifiers.js";
+
 export interface FacetExecutionConfig {
   facetId: string;
   versionId: string;
-  facetType: "external_http_api" | "hosted_actor" | "autonomous_agent";
+  facetType: FacetType;
   actorCode: string | null;
   imageDigest: string | null;
   pricingModel: "PAY_PER_RUN" | "PAY_PER_RESULT";
@@ -29,7 +31,7 @@ export function quoteVersion(
   const amount =
     version.pricingModel === "PAY_PER_RESULT" ? price * 20n : price;
   if (amount > maxAmount) throw new Error("PAYMENT_AMOUNT_EXCEEDS_CAP");
-  if (version.facetType !== "external_http_api" && !feeSplitAddress)
+  if (version.facetType !== "API" && !feeSplitAddress)
     throw new Error("FEE_SPLIT_CONTRACT_REQUIRED");
   if (version.pricingModel === "PAY_PER_RESULT" && !feeSplitAddress)
     throw new Error("FEE_SPLIT_CONTRACT_REQUIRED");
@@ -51,11 +53,10 @@ export function buildExecutorRequest(
   const base = {
     runId,
     facetId: version.facetId,
-    facetVersionId: version.versionId,
     input,
     timeoutMs: Math.min(version.timeoutMs || 15_000, 30_000),
   };
-  if (version.facetType === "hosted_actor") {
+  if (version.facetType === "ACTOR") {
     if (
       !version.actorCode ||
       !/^sha256:[0-9a-f]{64}$/iu.test(version.imageDigest ?? "")
@@ -63,14 +64,15 @@ export function buildExecutorRequest(
       throw new Error("ACTOR_BUNDLE_INVALID");
     return {
       ...base,
-      facetType: "HOSTED_ACTOR" as const,
+      facetType: "ACTOR" as const,
       actorBundle: {
         code: version.actorCode,
+        entrypoint: "run" as const,
         imageDigest: version.imageDigest,
       },
     };
   }
-  if (version.facetType === "autonomous_agent") {
+  if (version.facetType === "AGENT") {
     if (
       !version.erc8004TokenId ||
       !/^[1-9][0-9]*$/u.test(version.erc8004TokenId) ||
@@ -80,7 +82,7 @@ export function buildExecutorRequest(
       throw new Error("AGENT_CONFIG_INVALID");
     return {
       ...base,
-      facetType: "AUTONOMOUS_AGENT" as const,
+      facetType: "AGENT" as const,
       agentConfig: {
         erc8004ChainId: 43113 as const,
         erc8004Registry: version.erc8004Registry,

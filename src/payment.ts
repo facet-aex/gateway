@@ -21,6 +21,12 @@ export interface VersionQuote {
   payTo: string;
 }
 
+export interface FacetVersionRef {
+  provider: string;
+  facetName: string;
+  version: string;
+}
+
 const asset = "0xe7082a54a456dc4dfe0ceadcd0d0dce7d8ba176f";
 const network = "eip155:43113";
 
@@ -69,7 +75,7 @@ export function requirements(
 
 export function paymentChallenge(
   config: DemoPaymentConfig,
-  versionId: string,
+  target: FacetVersionRef,
   fingerprint: string,
   quote?: VersionQuote,
 ) {
@@ -86,8 +92,8 @@ export function paymentChallenge(
   const required: PaymentRequired = {
     x402Version: 2,
     resource: {
-      url: `${new URL(origin).origin}/v1/facet-versions/${versionId}/invoke?fingerprint=${fingerprint}`,
-      description: "FACET demo read-only API call",
+      url: `${new URL(origin).origin}/v1/facets/${encodeURIComponent(target.provider)}/${encodeURIComponent(target.facetName)}/versions/${encodeURIComponent(target.version)}/invoke?fingerprint=${fingerprint}`,
+      description: "FACET paid capability execution",
       mimeType: "application/json",
     },
     accepts: [requirements(config, quote)],
@@ -98,19 +104,15 @@ export function paymentChallenge(
 export function decodeAndCheckPayment(
   header: string,
   config: DemoPaymentConfig,
-  versionId: string,
+  target: FacetVersionRef,
   fingerprint: string,
   quote?: VersionQuote,
 ): PaymentPayload {
   const payload = decodePaymentSignatureHeader(header);
   const accepted = payload.accepted;
   const expected = requirements(config, quote);
-  const expectedResource = paymentChallenge(
-    config,
-    versionId,
-    fingerprint,
-    quote,
-  ).body.resource.url;
+  const expectedResource = paymentChallenge(config, target, fingerprint, quote)
+    .body.resource.url;
   if (
     payload.x402Version !== 2 ||
     payload.resource?.url !== expectedResource ||

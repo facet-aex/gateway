@@ -32,6 +32,11 @@ import {
   type FacetExecutionConfig,
 } from "./multimodal.js";
 import { canonicalJson } from "./canonical.js";
+import {
+  isValidFacetName,
+  isValidSemver,
+  isValidUsername,
+} from "./identifiers.js";
 
 try {
   loadEnvFile();
@@ -45,10 +50,12 @@ const pool = new Pool({
 });
 const app = Fastify({ logger: false, bodyLimit: 32_768 });
 const paymentConfig = readPaymentConfig();
-const idPattern =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 
-interface ContextRow extends OperationConfig, FacetExecutionConfig {}
+interface ContextRow extends OperationConfig, FacetExecutionConfig {
+  provider: string;
+  facetName: string;
+  version: string;
+}
 interface RunRow {
   id: string;
   request_fingerprint: string;
@@ -88,7 +95,7 @@ function paidMetadata(
     network: "eip155:43113" as const,
     amountAtomic,
     payer,
-    creatorPayTo: quote.creatorPayTo,
+    providerPayTo: quote.creatorPayTo,
     payTo: quote.payTo,
   };
 }
@@ -152,7 +159,11 @@ async function settleRun(
               paymentPayload: run.payment_payload,
               paymentRequirements: paymentChallenge(
                 paymentConfig,
-                config.versionId,
+                {
+                  provider: config.provider,
+                  facetName: config.facetName,
+                  version: config.version,
+                },
                 run.request_fingerprint,
                 quote,
               ).body.accepts[0],
@@ -229,8 +240,10 @@ async function settleRun(
       reply.header("PAYMENT-RESPONSE", encodePaymentResponseHeader(settled));
     return {
       runId: run.id,
-      facetVersionId: config.versionId,
-      facetType: config.facetType.toUpperCase(),
+      provider: config.provider,
+      facetName: config.facetName,
+      version: config.version,
+      facetType: config.facetType,
       result: run.result,
       dataset: run.dataset ?? [],
       usage: run.usage_meta ?? undefined,
@@ -250,13 +263,18 @@ async function settleRun(
 }
 
 app.get("/health/live", async () => ({ service: "gateway", status: "ok" }));
-app.post<{ Params: { versionId: string }; Body: { input?: unknown } }>(
-  "/v1/facet-versions/:versionId/invoke",
+app.post<{
+  Params: { provider: string; facetName: string; version: string };
+  Body: { input?: unknown };
+}>(
+  "/v1/facets/:provider/:facetName/versions/:version/invoke",
   async (request, reply) => {
-    const { versionId } = request.params;
+    const { provider, facetName, version } = request.params;
     const key = request.headers["idempotency-key"];
     if (
-      !idPattern.test(versionId) ||
+      !isValidUsername(provider) ||
+      !isValidFacetName(facetName) ||
+      !isValidSemver(version) ||
       typeof key !== "string" ||
       key.length < 1 ||
       key.length > 128
@@ -267,17 +285,23 @@ app.post<{ Params: { versionId: string }; Body: { input?: unknown } }>(
       return reply.code(400).send({ error: { code: "INPUT_INVALID" } });
     const context = await pool.query<ContextRow>(
       `
-    SELECT f.id AS "facetId", v.id AS "versionId", f.type AS "facetType", v.actor_code AS "actorCode", v.image_digest AS "imageDigest", v.pricing_model AS "pricingModel", v.price_atomic AS "priceAtomic", v.pay_to AS "payTo", v.erc8004_token_id AS "erc8004TokenId", v.erc8004_registry AS "erc8004Registry", v.agent_task_kind AS "agentTaskKind", e.protected_base_url AS "baseUrl", e.path_template AS "pathTemplate", e.method, e.auth_kind AS "authKind", e.auth_template AS "authTemplate", s.vault_provider AS "vaultProvider", s.vault_reference AS "vaultReference", s.status AS "secretStatus", COALESCE(e.timeout_ms,15000) AS "timeoutMs", e.max_response_bytes AS "maxResponseBytes", v.input_schema AS "inputSchema"
-    FROM facet_versions v JOIN facets f ON f.id=v.facet_id JOIN providers p ON p.id=f.provider_id LEFT JOIN endpoint_configs e ON e.id=v.endpoint_config_id LEFT JOIN secret_refs s ON s.id=e.secret_ref_id AND s.provider_id=f.provider_id
-    WHERE v.id=$1 AND f.current_published_version_id=v.id AND f.status='published' AND f.visibility='public' AND v.status='published' AND p.status='active'`,
-      [versionId],
+    SELECT u.username AS "provider", f.facet_name AS "facetName", v.version AS "version", f.id AS "facetId", v.id AS "versionId", f.type::text AS "facetType", v.actor_code AS "actorCode", v.image_digest AS "imageDigest", v.pricing_model AS "pricingModel", v.price_atomic AS "priceAtomic", v.pay_to AS "payTo", v.erc8004_token_id AS "erc8004TokenId", v.erc8004_registry AS "erc8004Registry", v.agent_task_kind AS "agentTaskKind", e.protected_base_url AS "baseUrl", e.path_template AS "pathTemplate", e.method, e.auth_kind AS "authKind", e.auth_template AS "authTemplate", s.vault_provider AS "vaultProvider", s.vault_reference AS "vaultReference", s.status AS "secretStatus", COALESCE(e.timeout_ms,15000) AS "timeoutMs", e.max_response_bytes AS "maxResponseBytes", v.input_schema AS "inputSchema"
+    FROM facet_versions v JOIN facets f ON f.id=v.facet_id JOIN users u ON u.id=f.provider_id LEFT JOIN endpoint_configs e ON e.id=v.endpoint_config_id LEFT JOIN secret_refs s ON s.id=e.secret_ref_id AND s.provider_id=f.provider_id
+    WHERE u.username=$1 AND f.facet_name=$2 AND v.version=$3 AND f.status='published' AND f.visibility IN ('public', 'unlisted') AND v.status='published' AND u.status='active'`,
+      [provider, facetName, version],
     );
     const config = context.rows[0];
     if (!config)
       return reply.code(404).send({ error: { code: "FACET_NOT_FOUND" } });
+    const versionId = config.versionId;
+    const targetRef = {
+      provider: config.provider,
+      facetName: config.facetName,
+      version: config.version,
+    };
     try {
       validateInput(config.inputSchema, input);
-      if (config.facetType === "external_http_api")
+      if (config.facetType === "API")
         buildUpstreamUrl(config, input as Record<string, unknown>);
     } catch (error) {
       return reply
@@ -294,7 +318,7 @@ app.post<{ Params: { versionId: string }; Body: { input?: unknown } }>(
           {
             ...config,
             payTo:
-              config.facetType === "external_http_api"
+              config.facetType === "API"
                 ? (config.payTo ?? paymentConfig.payTo)
                 : config.payTo,
           },
@@ -312,7 +336,7 @@ app.post<{ Params: { versionId: string }; Body: { input?: unknown } }>(
     if (paymentConfig && typeof signature !== "string") {
       const challenge = paymentChallenge(
         paymentConfig,
-        versionId,
+        targetRef,
         fingerprint,
         quote,
       );
@@ -365,7 +389,7 @@ app.post<{ Params: { versionId: string }; Body: { input?: unknown } }>(
         paymentPayload = decodeAndCheckPayment(
           signature as string,
           paymentConfig,
-          versionId,
+          targetRef,
           fingerprint,
           quote,
         );
@@ -405,8 +429,10 @@ app.post<{ Params: { versionId: string }; Body: { input?: unknown } }>(
       )
         return {
           runId: run.id,
-          facetVersionId: versionId,
-          facetType: config.facetType.toUpperCase(),
+          provider: config.provider,
+          facetName: config.facetName,
+          version: config.version,
+          facetType: config.facetType,
           result: run.result,
           dataset: run.dataset ?? [],
           usage: run.usage_meta ?? undefined,
@@ -601,8 +627,10 @@ app.post<{ Params: { versionId: string }; Body: { input?: unknown } }>(
             .send({ error: { code: "PAYMENT_STATE_INVALID" }, runId: run.id });
         return {
           runId: run.id,
-          facetVersionId: versionId,
-          facetType: config.facetType.toUpperCase(),
+          provider: config.provider,
+          facetName: config.facetName,
+          version: config.version,
+          facetType: config.facetType,
           result: run.result,
           dataset: run.dataset ?? [],
           usage: run.usage_meta ?? undefined,
@@ -660,7 +688,7 @@ app.post<{ Params: { versionId: string }; Body: { input?: unknown } }>(
           paymentPayload,
           paymentRequirements: paymentChallenge(
             paymentConfig,
-            versionId,
+            targetRef,
             fingerprint,
             quote,
           ).body.accepts[0],
@@ -710,7 +738,7 @@ app.post<{ Params: { versionId: string }; Body: { input?: unknown } }>(
     }
     try {
       let execution;
-      if (config.facetType === "external_http_api") {
+      if (config.facetType === "API") {
         const result = await executeGet(
           config,
           input as Record<string, unknown>,
@@ -768,8 +796,10 @@ app.post<{ Params: { versionId: string }; Body: { input?: unknown } }>(
         );
       return {
         runId,
-        facetVersionId: versionId,
-        facetType: config.facetType.toUpperCase(),
+        provider: config.provider,
+        facetName: config.facetName,
+        version: config.version,
+        facetType: config.facetType,
         result,
         dataset,
         usage,
