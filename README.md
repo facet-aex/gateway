@@ -1,11 +1,30 @@
-# gateway
+# FACET Gateway (`@facet/gateway`)
 
-Local Fuji MVP execution entrypoint for published, read-only public HTTPS GET Facets. The existing paid demo uses a preconfigured payer; ADR-0014 adds scoped Agent identity and policy-gated CLI wallet payments next.
+[![FACET](https://img.shields.io/badge/FACET-facet.briandev.space-050505?style=flat-square&labelColor=DFFF4F)](https://facet.briandev.space)
+[![Layer](https://img.shields.io/badge/RUNTIME-EXECUTION%20GATEWAY-0D0D0D?style=flat-square&labelColor=343434)](https://github.com/facet-aex)
 
-**Status:** free invocation and paid x402 invocation are verified with a provider-published Facet, MCP, real GitHub response and one confirmed fUSD transfer on Fuji. The browser and agents call this service, never provider endpoints directly. See the root `docs/implementation/demo-runbook.md` for transaction evidence.
+> Unified execution entrypoint and HTTP x402 payment enforcement gateway for published FACET capabilities.
 
-Run `npm ci`, copy `.env.example` to ignored `.env`, set `DATABASE_URL`, run `npm run db:migrate`, then `npm run dev`. The server listens on loopback port 4020 by default. It accepts `POST /v1/facet-versions/{versionId}/invoke` with `{ "input": { "path": { "owner": "octocat", "repo": "Hello-World" } } }` and an `Idempotency-Key` header. The Facet must be published, PUBLIC and a read-only GET. The endpoint may use a public HTTPS host; Gateway validates its DNS result, denies redirects and bounds response size/time. For API key or Bearer endpoints, set `FACET_SECRET_ROOT` to the same **absolute** local secret directory configured for Control API. Same-key replay returns the stored result. Enable `FACET_DEMO_X402_ENABLED=1` only after the facilitator is live and the payer is funded. A crash during upstream execution leaves the Run in progress for manual inspection; automatic recovery is deferred. This local process is not a production egress sandbox.
+## Overview
 
-For the supervised demo, the Gateway stores the public GitHub result and signed payment payload in local PostgreSQL to support replay and settlement. These records have no encryption or TTL. Do not use sensitive input/output, public deployment or production-value payment on this path.
+`gateway` is the public runtime invocation router for **FACET**. Every paid or free call to a published `API`, `ACTOR`, or `AGENT` Facet from the Web Playground, CLI, or MCP clients flows through its versioned invocation endpoint (`/v1/facets/:provider/:facetName/versions/:version/invoke`).
 
-Dependencies: Fastify 5.12.8 (MIT) serves local HTTP; pg 8.23.1 (MIT) accesses local PostgreSQL; Ajv 8.20.0 (MIT) validates input; ipaddr.js 2.2.0 (MIT) rejects non-public DNS results; official `@x402/core` 2.30.0 (Apache-2.0) handles x402 headers. TypeScript, tsx, Vitest and Prettier are development dependencies.
+## Role in FACET
+
+- **Single Execution Contract:** Validates caller inputs against the pinned `FacetVersion` JSON Schema and enforces `(callerId, facetVersionId, idempotencyKey)` replay protection.
+- **x402 Billing Orchestration:** Issues HTTP `402 Payment Required` challenges across configured pricing options (`PAY_PER_RUN` and `PAY_PER_RESULT`) and delegates verification and settlement to `x402-facilitator`.
+- **Multi-Modal Dispatch & Hardening:** Executes full-HTTP `API` upstream calls with DNS/IP pinning, SSRF checks, and write-only secret injection, while routing `ACTOR` and `AGENT` workloads to `executor`.
+- **Run & Dataset Persistence:** Records run states, normalized dataset outputs, and on-chain payment/receipt references in PostgreSQL.
+
+## Tech Stack
+
+| Layer | Technology |
+|---|---|
+| Runtime & HTTP | Node.js 24 (ESM), TypeScript, Fastify 5 |
+| Database | PostgreSQL (`pg`) |
+| Protocol & Security | `@x402/core`, Ajv (JSON Schema), `ipaddr.js` |
+| Testing & Container | Vitest, Prettier, Docker (`node:24-alpine`) |
+
+---
+
+Part of **[FACET](https://facet.briandev.space)** (`facet-aex`) — Federated Agent Capability Exchange & Trust on Avalanche.
