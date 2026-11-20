@@ -1,13 +1,37 @@
 import type { FacetType } from "./identifiers.js";
 
+export type PricingModel = "PAY_PER_RUN" | "PAY_PER_RESULT";
+
+export interface StoredPricingOption {
+  model: PricingModel;
+  priceAtomic: string;
+  maxItemsCap?: number | null;
+  maxAmountAtomic?: string;
+  payTo?: string | null;
+  isPrimary?: boolean;
+}
+
+export interface PaidQuote {
+  pricingModel: PricingModel;
+  unitPriceAtomic: string;
+  maxItemsCap?: number;
+  amount: string;
+  payTo: string;
+  creatorPayTo: string;
+  isPrimary: boolean;
+}
+
 export interface FacetExecutionConfig {
   facetId: string;
   versionId: string;
   facetType: FacetType;
+  facetDisplayName?: string;
   actorCode: string | null;
   imageDigest: string | null;
-  pricingModel: "PAY_PER_RUN" | "PAY_PER_RESULT";
+  pricingModel: PricingModel;
   priceAtomic: string;
+  pricingOptions?: StoredPricingOption[] | null;
+  maxItemsCap?: number | null;
   payTo: string | null;
   erc8004TokenId: string | null;
   erc8004Registry: string | null;
@@ -16,32 +40,156 @@ export interface FacetExecutionConfig {
 }
 
 const ADDRESS = /^0x[0-9a-f]{40}$/iu;
+const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 const CANONICAL_ERC8004 = "0x8004a818bfb912233c491871b3d84c89a494bd9e";
+
+export function isNonLocalEnv(env: NodeJS.ProcessEnv = process.env): boolean {
+  return (
+    env.NODE_ENV === "production" ||
+    (Boolean(env.FACET_ENV) && env.FACET_ENV !== "local")
+  );
+}
+
+export function quoteVersionOptions(
+  version: FacetExecutionConfig,
+  feeSplitAddress: string | undefined,
+  maxAmount: bigint,
+  options?: { isNonLocal?: boolean; fallbackPayTo?: string },
+): PaidQuote[] {
+  const nonLocal = options?.isNonLocal ?? isNonLocalEnv();
+  const normalizedFeeSplit = feeSplitAddress?.trim() || undefined;
+  if (
+    normalizedFeeSplit !== undefined &&
+    (!ADDRESS.test(normalizedFeeSplit) ||
+      normalizedFeeSplit.toLowerCase() === ZERO_ADDRESS)
+  ) {
+    throw new Error("PAYMENT_RECIPIENT_INVALID");
+  }
+
+  const rawOptions: StoredPricingOption[] =
+    Array.isArray(version.pricingOptions) && version.pricingOptions.length > 0
+      ? version.pricingOptions
+      : [
+          {
+            model: version.pricingModel,
+            priceAtomic: version.priceAtomic,
+            ...(version.pricingModel === "PAY_PER_RESULT"
+              ? { maxItemsCap: version.maxItemsCap ?? 20 }
+              : {}),
+            isPrimary: true,
+          },
+        ];
+
+  const seenModels = new Set<PricingModel>();
+  const quotes: PaidQuote[] = rawOptions.map((opt) => {
+    if (
+      !opt ||
+      typeof opt !== "object" ||
+      (opt.model !== "PAY_PER_RUN" && opt.model !== "PAY_PER_RESULT")
+    ) {
+      throw new Error("PAYMENT_PRICE_INVALID");
+    }
+    if (seenModels.has(opt.model)) throw new Error("PAYMENT_PRICE_INVALID");
+    seenModels.add(opt.model);
+
+    if (
+      typeof opt.priceAtomic !== "string" ||
+      !/^[1-9][0-9]*$/u.test(opt.priceAtomic)
+    ) {
+      throw new Error("PAYMENT_PRICE_INVALID");
+    }
+
+    let maxItemsCap: number | undefined;
+    if (opt.model === "PAY_PER_RESULT") {
+      const cap = opt.maxItemsCap ?? version.maxItemsCap ?? 20;
+      if (
+        typeof cap !== "number" ||
+        !Number.isSafeInteger(cap) ||
+        cap < 1 ||
+        cap > 1000
+      ) {
+        throw new Error("PAYMENT_PRICE_INVALID");
+      }
+      maxItemsCap = cap;
+    } else if (opt.maxItemsCap !== undefined && opt.maxItemsCap !== null) {
+      throw new Error("PAYMENT_PRICE_INVALID");
+    }
+
+    const rawPayTo =
+      (typeof opt.payTo === "string" && opt.payTo.trim()
+        ? opt.payTo.trim()
+        : undefined) ??
+      (typeof version.payTo === "string" && version.payTo.trim()
+        ? version.payTo.trim()
+        : undefined) ??
+      (nonLocal ? undefined : options?.fallbackPayTo?.trim() || undefined);
+
+    if (
+      !rawPayTo ||
+      !ADDRESS.test(rawPayTo) ||
+      rawPayTo.toLowerCase() === ZERO_ADDRESS
+    ) {
+      throw new Error("PAYMENT_RECIPIENT_INVALID");
+    }
+
+    const unitPrice = BigInt(opt.priceAtomic);
+    const amountBig =
+      opt.model === "PAY_PER_RESULT"
+        ? unitPrice * BigInt(maxItemsCap!)
+        : unitPrice;
+    if (
+      opt.maxAmountAtomic !== undefined &&
+      opt.maxAmountAtomic !== null &&
+      opt.maxAmountAtomic !== amountBig.toString()
+    ) {
+      throw new Error("PAYMENT_PRICE_INVALID");
+    }
+    if (amountBig > maxAmount) throw new Error("PAYMENT_AMOUNT_EXCEEDS_CAP");
+    if (version.facetType !== "API" && !normalizedFeeSplit) {
+      throw new Error("FEE_SPLIT_CONTRACT_REQUIRED");
+    }
+    if (opt.model === "PAY_PER_RESULT" && !normalizedFeeSplit) {
+      throw new Error("FEE_SPLIT_CONTRACT_REQUIRED");
+    }
+    const payTo = normalizedFeeSplit ?? rawPayTo;
+    return {
+      pricingModel: opt.model,
+      unitPriceAtomic: opt.priceAtomic,
+      ...(maxItemsCap !== undefined ? { maxItemsCap } : {}),
+      amount: amountBig.toString(),
+      payTo,
+      creatorPayTo: rawPayTo,
+      isPrimary: opt.isPrimary === true,
+    };
+  });
+
+  if (!quotes.some((quote) => quote.isPrimary)) {
+    const fallbackPrimary =
+      quotes.find((quote) => quote.pricingModel === "PAY_PER_RUN") ?? quotes[0];
+    if (fallbackPrimary) fallbackPrimary.isPrimary = true;
+  }
+
+  return quotes;
+}
 
 export function quoteVersion(
   version: FacetExecutionConfig,
   feeSplitAddress: string | undefined,
   maxAmount: bigint,
+  options?: { isNonLocal?: boolean; fallbackPayTo?: string },
 ) {
-  if (!/^[1-9][0-9]*$/u.test(version.priceAtomic))
-    throw new Error("PAYMENT_PRICE_INVALID");
-  if (!version.payTo || !ADDRESS.test(version.payTo))
-    throw new Error("PAYMENT_RECIPIENT_INVALID");
-  const price = BigInt(version.priceAtomic);
-  const amount =
-    version.pricingModel === "PAY_PER_RESULT" ? price * 20n : price;
-  if (amount > maxAmount) throw new Error("PAYMENT_AMOUNT_EXCEEDS_CAP");
-  if (version.facetType !== "API" && !feeSplitAddress)
-    throw new Error("FEE_SPLIT_CONTRACT_REQUIRED");
-  if (version.pricingModel === "PAY_PER_RESULT" && !feeSplitAddress)
-    throw new Error("FEE_SPLIT_CONTRACT_REQUIRED");
-  const payTo = feeSplitAddress || version.payTo;
-  if (!ADDRESS.test(payTo)) throw new Error("PAYMENT_RECIPIENT_INVALID");
+  const quotes = quoteVersionOptions(
+    version,
+    feeSplitAddress,
+    maxAmount,
+    options,
+  );
+  const primary = quotes.find((q) => q.isPrimary) ?? quotes[0]!;
   return {
-    pricingModel: version.pricingModel,
-    amount: amount.toString(),
-    payTo,
-    creatorPayTo: version.payTo,
+    pricingModel: primary.pricingModel,
+    amount: primary.amount,
+    payTo: primary.payTo,
+    creatorPayTo: primary.creatorPayTo,
   };
 }
 
