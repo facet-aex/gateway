@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { buildExecutorRequest, quoteVersion } from "../src/multimodal.js";
+import {
+  buildExecutorRequest,
+  quoteVersion,
+  quoteVersionOptions,
+} from "../src/multimodal.js";
 
 const facet = {
   facetId: "019a1234-5678-7abc-8def-123456789abc",
@@ -122,5 +126,109 @@ describe("multi-modal gateway planning", () => {
       },
     });
     expect(req).not.toHaveProperty("facetVersionId");
+  });
+
+  it("quoteVersionOptions returns 2 quotes for dual-pricing Facet and rejects missing payTo in non-local mode", () => {
+    const feeContract = "0x0000000000000000000000000000000000000002";
+    const quotes = quoteVersionOptions(
+      {
+        ...facet,
+        pricingModel: "PAY_PER_RUN",
+        priceAtomic: "1000",
+        maxItemsCap: 10,
+        pricingOptions: [
+          { model: "PAY_PER_RUN", priceAtomic: "1000", isPrimary: true },
+          {
+            model: "PAY_PER_RESULT",
+            priceAtomic: "500",
+            maxItemsCap: 10,
+            isPrimary: false,
+          },
+        ],
+      },
+      feeContract,
+      100000n,
+      { isNonLocal: true },
+    );
+    expect(quotes).toEqual([
+      {
+        pricingModel: "PAY_PER_RUN",
+        unitPriceAtomic: "1000",
+        amount: "1000",
+        payTo: feeContract,
+        creatorPayTo: facet.payTo,
+        isPrimary: true,
+      },
+      {
+        pricingModel: "PAY_PER_RESULT",
+        unitPriceAtomic: "500",
+        maxItemsCap: 10,
+        amount: "5000",
+        payTo: feeContract,
+        creatorPayTo: facet.payTo,
+        isPrimary: false,
+      },
+    ]);
+
+    expect(() =>
+      quoteVersionOptions(
+        { ...facet, facetType: "API", payTo: null },
+        feeContract,
+        100000n,
+        {
+          isNonLocal: true,
+          fallbackPayTo: "0x0000000000000000000000000000000000000009",
+        },
+      ),
+    ).toThrow("PAYMENT_RECIPIENT_INVALID");
+  });
+
+  it("quoteVersionOptions hydrates 0016 backfill, full options, and null/empty pricingOptions", () => {
+    const feeContract = "0x0000000000000000000000000000000000000002";
+    const emptyFallback = quoteVersionOptions(
+      { ...facet, pricingOptions: [] },
+      feeContract,
+      100000n,
+    );
+    expect(emptyFallback).toEqual([
+      {
+        pricingModel: "PAY_PER_RESULT",
+        unitPriceAtomic: "500",
+        maxItemsCap: 20,
+        amount: "10000",
+        payTo: feeContract,
+        creatorPayTo: facet.payTo,
+        isPrimary: true,
+      },
+    ]);
+
+    const fullOption = quoteVersionOptions(
+      {
+        ...facet,
+        pricingOptions: [
+          {
+            model: "PAY_PER_RESULT",
+            priceAtomic: "400",
+            maxItemsCap: 5,
+            maxAmountAtomic: "2000",
+            payTo: "0x0000000000000000000000000000000000000008",
+            isPrimary: true,
+          },
+        ],
+      },
+      feeContract,
+      100000n,
+    );
+    expect(fullOption).toEqual([
+      {
+        pricingModel: "PAY_PER_RESULT",
+        unitPriceAtomic: "400",
+        maxItemsCap: 5,
+        amount: "2000",
+        payTo: feeContract,
+        creatorPayTo: "0x0000000000000000000000000000000000000008",
+        isPrimary: true,
+      },
+    ]);
   });
 });
