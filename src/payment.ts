@@ -9,11 +9,12 @@ import type {
   SettleResponse,
   VerifyResponse,
 } from "@x402/core/types";
+import { isNonLocalEnv, type PaidQuote } from "./multimodal.js";
 
 export interface DemoPaymentConfig {
   facilitatorUrl: string;
   facilitatorToken: string;
-  payTo: string;
+  payTo?: string;
   amount: string;
 }
 export interface VersionQuote {
@@ -29,74 +30,132 @@ export interface FacetVersionRef {
 
 const asset = "0xe7082a54a456dc4dfe0ceadcd0d0dce7d8ba176f";
 const network = "eip155:43113";
+const ADDRESS = /^0x[a-f0-9]{40}$/iu;
 
-export function readPaymentConfig(): DemoPaymentConfig | undefined {
-  if (process.env.FACET_DEMO_X402_ENABLED !== "1") return undefined;
-  if (
-    process.env.NODE_ENV === "production" &&
-    (!process.env.FACET_PUBLIC_GATEWAY_ORIGIN ||
-      new URL(process.env.FACET_PUBLIC_GATEWAY_ORIGIN).protocol !== "https:")
-  ) {
+function isPaidQuote(quote: VersionQuote | PaidQuote): quote is PaidQuote {
+  return "pricingModel" in quote;
+}
+
+function isValidHttpsOrigin(value: string | undefined): boolean {
+  if (!value) return false;
+  try {
+    return new URL(value).protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+export function readPaymentConfig(
+  env: NodeJS.ProcessEnv = process.env,
+): DemoPaymentConfig | undefined {
+  if (env.FACET_DEMO_X402_ENABLED !== "1") return undefined;
+  const nonLocal = isNonLocalEnv(env);
+  if (nonLocal && !isValidHttpsOrigin(env.FACET_PUBLIC_GATEWAY_ORIGIN)) {
     throw new Error("PUBLIC_GATEWAY_ORIGIN_REQUIRED");
   }
-  const facilitatorUrl = process.env.FACET_FACILITATOR_URL;
-  const facilitatorToken = process.env.FACET_FACILITATOR_TOKEN;
-  const payTo = process.env.FACET_DEMO_PAY_TO;
-  const amount = process.env.FACET_DEMO_AMOUNT_ATOMIC ?? "1000";
+  const facilitatorUrl = env.FACET_FACILITATOR_URL;
+  const facilitatorToken = env.FACET_FACILITATOR_TOKEN;
+  const payTo = env.FACET_DEMO_PAY_TO?.trim() || undefined;
+  const amount = env.FACET_DEMO_AMOUNT_ATOMIC ?? "1000";
+  let facilitatorHostname = "";
+  if (facilitatorUrl) {
+    try {
+      facilitatorHostname = new URL(facilitatorUrl).hostname;
+    } catch {
+      facilitatorHostname = "";
+    }
+  }
   if (
     !facilitatorUrl ||
-    !["127.0.0.1", "x402-facilitator"].includes(
-      new URL(facilitatorUrl).hostname,
-    ) ||
+    !["127.0.0.1", "x402-facilitator"].includes(facilitatorHostname) ||
     !facilitatorToken ||
     facilitatorToken.length < 32 ||
-    !payTo ||
-    !/^0x[a-f0-9]{40}$/iu.test(payTo) ||
+    (!nonLocal && (!payTo || !ADDRESS.test(payTo))) ||
+    (nonLocal && payTo !== undefined && !ADDRESS.test(payTo)) ||
     !/^[1-9][0-9]{0,5}$/u.test(amount)
   )
     throw new Error("PAYMENT_CONFIG_INVALID");
-  return { facilitatorUrl, facilitatorToken, payTo, amount };
+  return {
+    facilitatorUrl,
+    facilitatorToken,
+    ...(payTo ? { payTo } : {}),
+    amount,
+  };
 }
 
 export function requirements(
   config: DemoPaymentConfig,
-  quote?: VersionQuote,
+  quote?: VersionQuote | PaidQuote,
 ): PaymentRequirements {
+  const payTo = quote?.payTo ?? config.payTo;
+  if (!payTo || !ADDRESS.test(payTo))
+    throw new Error("PAYMENT_RECIPIENT_INVALID");
+  if (quote && isPaidQuote(quote)) {
+    return {
+      scheme: "exact",
+      network,
+      asset,
+      amount: quote.amount,
+      payTo,
+      maxTimeoutSeconds: 60,
+      extra: {
+        name: "FACET USD",
+        version: "2",
+        pricingModel: quote.pricingModel,
+        unitPriceAtomic: quote.unitPriceAtomic,
+        ...(quote.pricingModel === "PAY_PER_RESULT" &&
+        quote.maxItemsCap !== undefined
+          ? { maxItemsCap: quote.maxItemsCap }
+          : {}),
+        providerPayTo: quote.creatorPayTo,
+      },
+    };
+  }
   return {
     scheme: "exact",
     network,
     asset,
     amount: quote?.amount ?? config.amount,
-    payTo: quote?.payTo ?? config.payTo,
+    payTo,
     maxTimeoutSeconds: 60,
     extra: { name: "FACET USD", version: "2" },
   };
+}
+
+function challengeResourceUrl(
+  target: FacetVersionRef,
+  fingerprint: string,
+): string {
+  const publicOrigin = process.env.FACET_PUBLIC_GATEWAY_ORIGIN;
+  if (isNonLocalEnv() && !isValidHttpsOrigin(publicOrigin)) {
+    throw new Error("PUBLIC_GATEWAY_ORIGIN_REQUIRED");
+  }
+  const origin =
+    publicOrigin ??
+    `http://127.0.0.1:${process.env.FACET_GATEWAY_PORT ?? "4020"}`;
+  return `${new URL(origin).origin}/v1/facets/${encodeURIComponent(target.provider)}/${encodeURIComponent(target.facetName)}/versions/${encodeURIComponent(target.version)}/invoke?fingerprint=${fingerprint}`;
 }
 
 export function paymentChallenge(
   config: DemoPaymentConfig,
   target: FacetVersionRef,
   fingerprint: string,
-  quote?: VersionQuote,
+  quoteOrQuotes?: VersionQuote | PaidQuote | PaidQuote[],
 ) {
-  const publicOrigin = process.env.FACET_PUBLIC_GATEWAY_ORIGIN;
-  if (
-    process.env.NODE_ENV === "production" &&
-    (!publicOrigin || new URL(publicOrigin).protocol !== "https:")
-  ) {
-    throw new Error("PUBLIC_GATEWAY_ORIGIN_REQUIRED");
-  }
-  const origin =
-    publicOrigin ??
-    `http://127.0.0.1:${process.env.FACET_GATEWAY_PORT ?? "4020"}`;
+  const accepts = Array.isArray(quoteOrQuotes)
+    ? (() => {
+        if (quoteOrQuotes.length === 0) throw new Error("PAYMENT_QUOTES_EMPTY");
+        return quoteOrQuotes.map((quote) => requirements(config, quote));
+      })()
+    : [requirements(config, quoteOrQuotes)];
   const required: PaymentRequired = {
     x402Version: 2,
     resource: {
-      url: `${new URL(origin).origin}/v1/facets/${encodeURIComponent(target.provider)}/${encodeURIComponent(target.facetName)}/versions/${encodeURIComponent(target.version)}/invoke?fingerprint=${fingerprint}`,
+      url: challengeResourceUrl(target, fingerprint),
       description: "FACET paid capability execution",
       mimeType: "application/json",
     },
-    accepts: [requirements(config, quote)],
+    accepts,
   };
   return { header: encodePaymentRequiredHeader(required), body: required };
 }
@@ -106,26 +165,93 @@ export function decodeAndCheckPayment(
   config: DemoPaymentConfig,
   target: FacetVersionRef,
   fingerprint: string,
-  quote?: VersionQuote,
-): PaymentPayload {
+  quotes: PaidQuote[],
+): { payload: PaymentPayload; selectedQuote: PaidQuote };
+export function decodeAndCheckPayment(
+  header: string,
+  config: DemoPaymentConfig,
+  target: FacetVersionRef,
+  fingerprint: string,
+  quote?: VersionQuote | PaidQuote,
+): PaymentPayload;
+export function decodeAndCheckPayment(
+  header: string,
+  config: DemoPaymentConfig,
+  target: FacetVersionRef,
+  fingerprint: string,
+  quoteOrQuotes?: VersionQuote | PaidQuote | PaidQuote[],
+): PaymentPayload | { payload: PaymentPayload; selectedQuote: PaidQuote } {
   const payload = decodePaymentSignatureHeader(header);
   const accepted = payload.accepted;
-  const expected = requirements(config, quote);
-  const expectedResource = paymentChallenge(config, target, fingerprint, quote)
-    .body.resource.url;
+  const expectedResource = challengeResourceUrl(target, fingerprint);
   if (
     payload.x402Version !== 2 ||
     payload.resource?.url !== expectedResource ||
-    accepted.scheme !== expected.scheme ||
-    accepted.network !== expected.network ||
-    accepted.asset.toLowerCase() !== expected.asset.toLowerCase() ||
-    accepted.amount !== expected.amount ||
-    accepted.payTo.toLowerCase() !== expected.payTo.toLowerCase() ||
+    !accepted ||
+    typeof accepted !== "object" ||
+    accepted.scheme !== "exact" ||
+    accepted.network !== network ||
+    typeof accepted.asset !== "string" ||
+    accepted.asset.toLowerCase() !== asset.toLowerCase() ||
+    typeof accepted.payTo !== "string" ||
     accepted.maxTimeoutSeconds !== 60 ||
     accepted.extra?.name !== "FACET USD" ||
     accepted.extra?.version !== "2"
-  )
+  ) {
     throw new Error("PAYMENT_REQUIREMENTS_MISMATCH");
+  }
+
+  if (Array.isArray(quoteOrQuotes)) {
+    const extra = accepted.extra as Record<string, unknown>;
+    const selectedQuote = quoteOrQuotes.find((quote) => {
+      const expected = requirements(config, quote);
+      if (
+        accepted.amount !== expected.amount ||
+        accepted.payTo.toLowerCase() !== expected.payTo.toLowerCase()
+      ) {
+        return false;
+      }
+      if (extra.pricingModel !== quote.pricingModel) return false;
+      if (extra.unitPriceAtomic !== quote.unitPriceAtomic) return false;
+      if (
+        typeof extra.providerPayTo !== "string" ||
+        extra.providerPayTo.toLowerCase() !== quote.creatorPayTo.toLowerCase()
+      ) {
+        return false;
+      }
+      if (quote.pricingModel === "PAY_PER_RESULT") {
+        if (extra.maxItemsCap !== quote.maxItemsCap) return false;
+      } else if (extra.maxItemsCap !== undefined) {
+        return false;
+      }
+      return true;
+    });
+    if (!selectedQuote) throw new Error("PAYMENT_REQUIREMENTS_MISMATCH");
+    return { payload, selectedQuote };
+  }
+
+  const expected = requirements(config, quoteOrQuotes);
+  if (
+    accepted.amount !== expected.amount ||
+    accepted.payTo.toLowerCase() !== expected.payTo.toLowerCase()
+  ) {
+    throw new Error("PAYMENT_REQUIREMENTS_MISMATCH");
+  }
+  if (quoteOrQuotes && isPaidQuote(quoteOrQuotes)) {
+    const extra = accepted.extra as Record<string, unknown>;
+    if (
+      extra.pricingModel !== quoteOrQuotes.pricingModel ||
+      extra.unitPriceAtomic !== quoteOrQuotes.unitPriceAtomic ||
+      typeof extra.providerPayTo !== "string" ||
+      extra.providerPayTo.toLowerCase() !==
+        quoteOrQuotes.creatorPayTo.toLowerCase() ||
+      (quoteOrQuotes.pricingModel === "PAY_PER_RESULT"
+        ? extra.maxItemsCap !== quoteOrQuotes.maxItemsCap
+        : extra.maxItemsCap !== undefined)
+    ) {
+      throw new Error("PAYMENT_REQUIREMENTS_MISMATCH");
+    }
+  }
   return payload;
 }
 
@@ -153,7 +279,7 @@ async function facilitatorCall<T>(
   config: DemoPaymentConfig,
   operation: "verify" | "settle",
   paymentPayload: PaymentPayload,
-  quote?: VersionQuote,
+  quote?: VersionQuote | PaidQuote,
 ): Promise<T> {
   const response = await fetch(
     new URL(`/${operation}`, config.facilitatorUrl),
@@ -179,12 +305,12 @@ async function facilitatorCall<T>(
 export const verifyPayment = (
   config: DemoPaymentConfig,
   payload: PaymentPayload,
-  quote?: VersionQuote,
+  quote?: VersionQuote | PaidQuote,
 ) => facilitatorCall<VerifyResponse>(config, "verify", payload, quote);
 export const settlePayment = (
   config: DemoPaymentConfig,
   payload: PaymentPayload,
-  quote?: VersionQuote,
+  quote?: VersionQuote | PaidQuote,
 ) => facilitatorCall<SettleResponse>(config, "settle", payload, quote);
 
 export type ContractPhase =

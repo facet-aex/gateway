@@ -14,6 +14,7 @@ import {
   type DemoPaymentConfig,
   type FacetVersionRef,
 } from "../src/payment.js";
+import type { PaidQuote } from "../src/multimodal.js";
 
 const config: DemoPaymentConfig = {
   facilitatorUrl: "http://127.0.0.1:4022",
@@ -198,6 +199,178 @@ describe("Gateway x402 challenge", () => {
         config,
         target,
         fingerprint,
+      ),
+    ).toThrow("PAYMENT_REQUIREMENTS_MISMATCH");
+  });
+
+  it("allows missing FACET_DEMO_PAY_TO when non-local (NODE_ENV=production or FACET_ENV=staging)", () => {
+    const previous = { ...process.env };
+    try {
+      process.env.FACET_DEMO_X402_ENABLED = "1";
+      process.env.FACET_FACILITATOR_URL = "http://x402-facilitator:4022";
+      process.env.FACET_FACILITATOR_TOKEN = "a".repeat(32);
+      process.env.FACET_PUBLIC_GATEWAY_ORIGIN =
+        "https://staging.facet.briandev.space";
+      delete process.env.FACET_DEMO_PAY_TO;
+      process.env.NODE_ENV = "production";
+      expect(readPaymentConfig()?.payTo).toBeUndefined();
+
+      delete process.env.NODE_ENV;
+      process.env.FACET_ENV = "staging";
+      expect(readPaymentConfig()?.payTo).toBeUndefined();
+
+      process.env.FACET_ENV = "local";
+      expect(() => readPaymentConfig()).toThrow("PAYMENT_CONFIG_INVALID");
+    } finally {
+      process.env = previous;
+    }
+  });
+
+  it("paymentChallenge emits accepts[] with PAY_PER_RUN and PAY_PER_RESULT extra metadata", () => {
+    const feeSplit = "0x0000000000000000000000000000000000000004";
+    const creator = "0x0000000000000000000000000000000000000001";
+    const quotes: PaidQuote[] = [
+      {
+        pricingModel: "PAY_PER_RUN",
+        unitPriceAtomic: "1000",
+        amount: "1000",
+        payTo: feeSplit,
+        creatorPayTo: creator,
+        isPrimary: true,
+      },
+      {
+        pricingModel: "PAY_PER_RESULT",
+        unitPriceAtomic: "500",
+        maxItemsCap: 10,
+        amount: "5000",
+        payTo: feeSplit,
+        creatorPayTo: creator,
+        isPrimary: false,
+      },
+    ];
+    const challenge = paymentChallenge(config, target, fingerprint, quotes);
+    expect(challenge.body.accepts).toHaveLength(2);
+    expect(challenge.body.accepts[0]?.extra).toEqual({
+      name: "FACET USD",
+      version: "2",
+      pricingModel: "PAY_PER_RUN",
+      unitPriceAtomic: "1000",
+      providerPayTo: creator,
+    });
+    expect(challenge.body.accepts[0]?.extra).not.toHaveProperty("maxItemsCap");
+    expect(challenge.body.accepts[1]?.extra).toEqual({
+      name: "FACET USD",
+      version: "2",
+      pricingModel: "PAY_PER_RESULT",
+      unitPriceAtomic: "500",
+      maxItemsCap: 10,
+      providerPayTo: creator,
+    });
+  });
+
+  it("decodeAndCheckPayment disambiguates identical-amount PAY_PER_RUN vs PAY_PER_RESULT via accepted.extra", () => {
+    const feeSplit = "0x0000000000000000000000000000000000000004";
+    const creator = "0x0000000000000000000000000000000000000001";
+    const quotes: PaidQuote[] = [
+      {
+        pricingModel: "PAY_PER_RUN",
+        unitPriceAtomic: "10000",
+        amount: "10000",
+        payTo: feeSplit,
+        creatorPayTo: creator,
+        isPrimary: true,
+      },
+      {
+        pricingModel: "PAY_PER_RESULT",
+        unitPriceAtomic: "500",
+        maxItemsCap: 20,
+        amount: "10000",
+        payTo: feeSplit,
+        creatorPayTo: creator,
+        isPrimary: false,
+      },
+    ];
+    const challenge = paymentChallenge(
+      config,
+      target,
+      fingerprint,
+      quotes,
+    ).body;
+    const resultPayload = {
+      x402Version: 2,
+      resource: challenge.resource,
+      accepted: {
+        ...challenge.accepts[1]!,
+        extra: {
+          ...challenge.accepts[1]!.extra,
+          providerPayTo: creator.toUpperCase(),
+        },
+      },
+      payload: {
+        authorization: { from: "0x0000000000000000000000000000000000000002" },
+      },
+    };
+    const decoded = decodeAndCheckPayment(
+      encodePaymentSignatureHeader(resultPayload),
+      config,
+      target,
+      fingerprint,
+      quotes,
+    );
+    expect(decoded.selectedQuote).toEqual(quotes[1]);
+
+    // Rejects tampered extra even when amount & payTo match
+    expect(() =>
+      decodeAndCheckPayment(
+        encodePaymentSignatureHeader({
+          ...resultPayload,
+          accepted: {
+            ...challenge.accepts[1]!,
+            extra: {
+              ...challenge.accepts[1]!.extra,
+              maxItemsCap: 19,
+            },
+          },
+        }),
+        config,
+        target,
+        fingerprint,
+        quotes,
+      ),
+    ).toThrow("PAYMENT_REQUIREMENTS_MISMATCH");
+
+    expect(() =>
+      decodeAndCheckPayment(
+        encodePaymentSignatureHeader({
+          ...resultPayload,
+          accepted: {
+            ...challenge.accepts[0]!,
+            extra: {
+              ...challenge.accepts[0]!.extra,
+              maxItemsCap: 20,
+            },
+          },
+        }),
+        config,
+        target,
+        fingerprint,
+        quotes,
+      ),
+    ).toThrow("PAYMENT_REQUIREMENTS_MISMATCH");
+
+    expect(() =>
+      decodeAndCheckPayment(
+        encodePaymentSignatureHeader({
+          ...resultPayload,
+          accepted: {
+            scheme: "exact",
+            network: "eip155:43113",
+          } as unknown as (typeof resultPayload)["accepted"],
+        }),
+        config,
+        target,
+        fingerprint,
+        quotes,
       ),
     ).toThrow("PAYMENT_REQUIREMENTS_MISMATCH");
   });
