@@ -77,10 +77,54 @@ export interface BuildGatewayAppOptions {
   executorUrl?: string;
   executorToken?: string;
   isNonLocal?: boolean;
+  enableEscrowReconciler?: boolean;
 }
 
 const RUN_SELECT_COLUMNS =
-  "id, request_fingerprint, input_hash, status, result, dataset, usage_meta, receipt_tx_hash, error_code, payment_state, payment_payload, payment_tx_hash, pricing_model, unit_price_atomic, max_items_cap, max_amount_atomic, deposit_tx_hash, refund_amount_atomic";
+  "id, request_fingerprint, input_hash, status, result, dataset, usage_meta, receipt_tx_hash, error_code, payment_state, payment_payload, payment_tx_hash, pricing_model, unit_price_atomic, max_items_cap, max_amount_atomic, deposit_tx_hash, refund_amount_atomic, escrow_expires_at";
+
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
+
+export async function reconcileStaleEscrows(
+  pool: GatewayPool,
+  paymentConfig: DemoPaymentConfig,
+): Promise<void> {
+  const staleRows = await pool.query<{
+    id: string;
+    max_amount_atomic: string | null;
+  }>(
+    `SELECT id, max_amount_atomic
+     FROM facet_demo_runs
+     WHERE pricing_model='PAY_PER_RESULT'
+       AND ((status='EXECUTING' AND payment_state='ESCROW_LOCKED' AND updated_at < now() - interval '60 seconds')
+         OR (status='FAILED' AND payment_state IN ('ESCROW_LOCKED','PENDING')))
+     ORDER BY updated_at ASC
+     LIMIT 10`,
+  );
+  for (const row of staleRows.rows) {
+    try {
+      await pool.query(
+        "UPDATE facet_demo_runs SET status='FAILED', payment_state='PENDING', error_code=COALESCE(error_code,'RUN_EXECUTION_UNCERTAIN'), updated_at=now() WHERE id=$1 AND status IN ('EXECUTING','FAILED')",
+        [row.id],
+      );
+      const refund = await contractPaymentCall(paymentConfig, "REFUND", {
+        runId: row.id,
+      });
+      await pool.query(
+        "UPDATE facet_demo_runs SET payment_state=$2, payment_tx_hash=$3, refund_amount_atomic=$4, updated_at=now() WHERE id=$1",
+        [
+          row.id,
+          refund.status === "CONFIRMED" ? "REFUNDED" : "PENDING",
+          refund.transaction,
+          refund.status === "CONFIRMED" ? (row.max_amount_atomic ?? null) : null,
+        ],
+      );
+    } catch {
+      /* Retry on next sweep or caller retry. */
+    }
+  }
+}
 
 export function buildGatewayApp(options: BuildGatewayAppOptions) {
   const {
@@ -93,9 +137,20 @@ export function buildGatewayApp(options: BuildGatewayAppOptions) {
     executorUrl = process.env.FACET_EXECUTOR_URL ?? "http://127.0.0.1:4030",
     executorToken = process.env.FACET_EXECUTOR_TOKEN ?? "",
     isNonLocal = isNonLocalEnv(),
+    enableEscrowReconciler = true,
   } = options;
 
   const app = Fastify({ logger: false, bodyLimit: 32_768 });
+
+  if (paymentConfig && enableEscrowReconciler) {
+    const timer = setInterval(() => {
+      void reconcileStaleEscrows(pool, paymentConfig).catch(() => {});
+    }, 30_000);
+    timer.unref();
+    app.addHook("onClose", async () => {
+      clearInterval(timer);
+    });
+  }
 
   async function settleRun(
     run: RunSnapshotRow,
@@ -122,6 +177,45 @@ export function buildGatewayApp(options: BuildGatewayAppOptions) {
       let paymentTxHash = run.payment_tx_hash;
       let settled: Awaited<ReturnType<typeof settlePayment>> | undefined;
       if (contractRoute) {
+        if (
+          quote.pricingModel === "PAY_PER_RESULT" &&
+          run.escrow_expires_at &&
+          Date.now() >= Date.parse(run.escrow_expires_at)
+        ) {
+          const refundAmountAtomic = run.max_amount_atomic ?? quote.amount;
+          const refund = await contractPaymentCall(paymentConfig, "REFUND", {
+            runId: run.id,
+          });
+          await pool.query(
+            "UPDATE facet_demo_runs SET status='FAILED', error_code='ESCROW_EXPIRED', payment_state=$2, payment_tx_hash=$3, refund_amount_atomic=$4, updated_at=now() WHERE id=$1",
+            [
+              run.id,
+              refund.status === "CONFIRMED" ? "REFUNDED" : "PENDING",
+              refund.transaction,
+              refund.status === "CONFIRMED" ? refundAmountAtomic : null,
+            ],
+          );
+          if (refund.status === "CONFIRMED") {
+            return reply
+              .code(502)
+              .send(
+                buildRefundedErrorResponse(
+                  "ESCROW_EXPIRED",
+                  run.id,
+                  refund.transaction,
+                  refundAmountAtomic,
+                ),
+              );
+          }
+          return reply.code(202).send({
+            runId: run.id,
+            payment: {
+              status: "refund_pending",
+              transaction: refund.transaction,
+              escrowExpiresAt: run.escrow_expires_at,
+            },
+          });
+        }
         const phase =
           quote.pricingModel === "PAY_PER_RESULT"
             ? "SETTLE_RESULT"
@@ -146,7 +240,16 @@ export function buildGatewayApp(options: BuildGatewayAppOptions) {
                   quote,
                 ).body.accepts[0],
               }
-            : { runId: run.id, ...proof };
+            : {
+                runId: run.id,
+                inputHash: proof.inputHash,
+                outputHash: proof.outputHash,
+                itemCount: proof.itemCount,
+                runnerSignature: proof.runnerSignature,
+                ...(proof.escrowSignature
+                  ? { escrowSignature: proof.escrowSignature }
+                  : {}),
+              };
         const phaseResult = await contractPaymentCall(
           paymentConfig,
           phase,
@@ -167,6 +270,9 @@ export function buildGatewayApp(options: BuildGatewayAppOptions) {
             payment: {
               status: "settlement_pending",
               transaction: paymentTxHash,
+              ...(run.escrow_expires_at
+                ? { escrowExpiresAt: run.escrow_expires_at }
+                : {}),
             },
           });
         }
@@ -213,7 +319,13 @@ export function buildGatewayApp(options: BuildGatewayAppOptions) {
           );
           return reply.code(202).send({
             runId: run.id,
-            payment: { status: "receipt_pending", transaction: paymentTxHash },
+            payment: {
+              status: "receipt_pending",
+              transaction: paymentTxHash,
+              ...(run.escrow_expires_at
+                ? { escrowExpiresAt: run.escrow_expires_at }
+                : {}),
+            },
           });
         }
       }
@@ -255,13 +367,56 @@ export function buildGatewayApp(options: BuildGatewayAppOptions) {
         "UPDATE facet_demo_runs SET payment_state='PENDING', updated_at=now() WHERE id=$1",
         [run.id],
       );
-      return reply
-        .code(202)
-        .send({ runId: run.id, payment: { status: "settlement_pending" } });
+      return reply.code(202).send({
+        runId: run.id,
+        payment: {
+          status: "settlement_pending",
+          ...(run.escrow_expires_at
+            ? { escrowExpiresAt: run.escrow_expires_at }
+            : {}),
+        },
+      });
     }
   }
 
   app.get("/health/live", async () => ({ service: "gateway", status: "ok" }));
+  app.get<{ Params: { runId: string } }>(
+    "/v1/runs/:runId/escrow",
+    async (request, reply) => {
+      const { runId } = request.params;
+      if (!UUID_RE.test(runId))
+        return reply.code(400).send({ error: { code: "INPUT_INVALID" } });
+      const found = await pool.query<{
+        id: string;
+        status: string;
+        payment_state: string;
+        pricing_model: string | null;
+        max_amount_atomic: string | null;
+        deposit_tx_hash: string | null;
+        escrow_expires_at: string | Date | null;
+      }>(
+        "SELECT id, status, payment_state, pricing_model, max_amount_atomic, deposit_tx_hash, escrow_expires_at FROM facet_demo_runs WHERE id=$1",
+        [runId],
+      );
+      const row = found.rows[0];
+      if (!row)
+        return reply.code(404).send({ error: { code: "RUN_NOT_FOUND" } });
+      const expiresAt =
+        row.escrow_expires_at instanceof Date
+          ? row.escrow_expires_at.toISOString()
+          : (row.escrow_expires_at ?? null);
+      return {
+        runId: row.id,
+        status: row.status,
+        paymentState: row.payment_state,
+        pricingModel: row.pricing_model,
+        depositedAmountAtomic: row.max_amount_atomic,
+        depositTxHash: row.deposit_tx_hash,
+        escrowExpiresAt: expiresAt,
+        contractAddress: feeSplitAddress ?? null,
+      };
+    },
+  );
   app.post<{
     Params: { provider: string; facetName: string; version: string };
     Body: { input?: unknown; pricingModel?: unknown };
@@ -665,6 +820,7 @@ export function buildGatewayApp(options: BuildGatewayAppOptions) {
           )
         : selectedQuote;
       let depositTxHash = resumedRun?.deposit_tx_hash ?? null;
+      let escrowExpiresAt = resumedRun?.escrow_expires_at ?? null;
       let inserted: { rows: Record<string, unknown>[] };
       try {
         inserted = resumedRun
@@ -843,9 +999,10 @@ export function buildGatewayApp(options: BuildGatewayAppOptions) {
             });
           }
           depositTxHash = deposit.transaction;
+          escrowExpiresAt = deposit.escrowExpiresAt ?? escrowExpiresAt;
           const claim = await pool.query<{ id: string }>(
-            "UPDATE facet_demo_runs SET payment_state='ESCROW_LOCKED', payment_tx_hash=NULL, deposit_tx_hash=$2, updated_at=now() WHERE id=$1 AND payment_state IN ('VERIFIED','PENDING') RETURNING id",
-            [runId, depositTxHash],
+            "UPDATE facet_demo_runs SET payment_state='ESCROW_LOCKED', payment_tx_hash=NULL, deposit_tx_hash=$2, escrow_expires_at=COALESCE($3::timestamptz, escrow_expires_at), updated_at=now() WHERE id=$1 AND payment_state IN ('VERIFIED','PENDING') RETURNING id",
+            [runId, depositTxHash, escrowExpiresAt],
           );
           if (!claim.rows[0])
             return reply
@@ -940,6 +1097,7 @@ export function buildGatewayApp(options: BuildGatewayAppOptions) {
               max_items_cap: activeQuote!.maxItemsCap ?? null,
               max_amount_atomic: activeQuote!.amount,
               deposit_tx_hash: depositTxHash,
+              escrow_expires_at: escrowExpiresAt,
             },
             config,
             activeQuote!,
