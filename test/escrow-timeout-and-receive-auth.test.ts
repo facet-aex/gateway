@@ -103,7 +103,9 @@ describe("Gateway ReceiveWithAuthorization & Escrow Timeout", () => {
       creatorPayTo: CREATOR_PAY_TO,
       isPrimary: true,
     });
-    expect(contractReq.extra?.authorizationType).toBe("ReceiveWithAuthorization");
+    expect(contractReq.extra?.authorizationType).toBe(
+      "ReceiveWithAuthorization",
+    );
 
     const directReq = requirements(
       {
@@ -175,13 +177,26 @@ describe("Gateway ReceiveWithAuthorization & Escrow Timeout", () => {
 
   it("persists escrow_expires_at on DEPOSIT, sends escrowSignature to SETTLE_RESULT, and exposes GET /v1/runs/:runId/escrow", async () => {
     const ctx = makeContext();
-    const runs: Array<RunSnapshotRow & { caller_id: string; facet_version_id: string; idempotency_key: string; payment_payload_hash: string | null }> = [];
+    const runs: Array<
+      RunSnapshotRow & {
+        caller_id: string;
+        facet_version_id: string;
+        idempotency_key: string;
+        payment_payload_hash: string | null;
+      }
+    > = [];
     const pool: GatewayPool = {
-      async query<R = Record<string, unknown>>(sql: string, values: unknown[] = []): Promise<{ rows: R[] }> {
+      async query<R = Record<string, unknown>>(
+        sql: string,
+        values: unknown[] = [],
+      ): Promise<{ rows: R[] }> {
         const q = sql.replace(/\s+/g, " ").trim();
-        if (q.startsWith("SELECT u.username AS")) return { rows: [ctx] as unknown as R[] };
-        if (q.includes("FROM facet_demo_runs WHERE payment_payload_hash=$1")) return { rows: [] };
-        if (q.includes("FROM facet_demo_runs WHERE caller_id=$1")) return { rows: [] };
+        if (q.startsWith("SELECT u.username AS"))
+          return { rows: [ctx] as unknown as R[] };
+        if (q.includes("FROM facet_demo_runs WHERE payment_payload_hash=$1"))
+          return { rows: [] };
+        if (q.includes("FROM facet_demo_runs WHERE caller_id=$1"))
+          return { rows: [] };
         if (q.includes("FROM facet_demo_runs WHERE id=$1")) {
           const found = runs.find((r) => r.id === values[0]);
           return { rows: (found ? [found] : []) as unknown as R[] };
@@ -215,7 +230,11 @@ describe("Gateway ReceiveWithAuthorization & Escrow Timeout", () => {
           runs.push(row);
           return { rows: [row] as unknown as R[] };
         }
-        if (q.startsWith("UPDATE facet_demo_runs SET payment_state='ESCROW_LOCKED'")) {
+        if (
+          q.startsWith(
+            "UPDATE facet_demo_runs SET payment_state='ESCROW_LOCKED'",
+          )
+        ) {
           const r = runs.find((x) => x.id === values[0]);
           if (!r) return { rows: [] };
           r.payment_state = "ESCROW_LOCKED";
@@ -233,7 +252,9 @@ describe("Gateway ReceiveWithAuthorization & Escrow Timeout", () => {
           r.input_hash = values[4] as string;
           return { rows: [{ id: r.id }] as unknown as R[] };
         }
-        if (q.startsWith("UPDATE facet_demo_runs SET payment_state='SETTLING'")) {
+        if (
+          q.startsWith("UPDATE facet_demo_runs SET payment_state='SETTLING'")
+        ) {
           const r = runs.find((x) => x.id === values[0]);
           if (!r) return { rows: [] };
           r.payment_state = "SETTLING";
@@ -249,7 +270,9 @@ describe("Gateway ReceiveWithAuthorization & Escrow Timeout", () => {
           if (r) r.receipt_tx_hash = values[1] as string;
           return { rows: [] };
         }
-        if (q.startsWith("UPDATE facet_demo_runs SET payment_state='SETTLED'")) {
+        if (
+          q.startsWith("UPDATE facet_demo_runs SET payment_state='SETTLED'")
+        ) {
           const r = runs.find((x) => x.id === values[0]);
           if (r) {
             r.payment_state = "SETTLED";
@@ -265,37 +288,52 @@ describe("Gateway ReceiveWithAuthorization & Escrow Timeout", () => {
     const settleBodies: Record<string, unknown>[] = [];
     const expiresAtIso = "2027-01-15T08:15:00.000Z";
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
-      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      const url =
+        typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input.url;
       if (url.endsWith("/verify")) {
-        return new Response(JSON.stringify({ isValid: true, payer: BUYER_PAYER }));
+        return new Response(
+          JSON.stringify({ isValid: true, payer: BUYER_PAYER }),
+        );
       }
       if (url.endsWith("/v1/contract/DEPOSIT")) {
-        return new Response(JSON.stringify({
-          status: "CONFIRMED",
-          transaction: DEPOSIT_TX,
-          escrowExpiresAt: expiresAtIso,
-        }));
+        return new Response(
+          JSON.stringify({
+            status: "CONFIRMED",
+            transaction: DEPOSIT_TX,
+            escrowExpiresAt: expiresAtIso,
+          }),
+        );
       }
       if (url.endsWith("/v1/execute")) {
-        return new Response(JSON.stringify({
-          status: "SUCCEEDED",
-          result: [{ title: "item1" }],
-          dataset: [{ title: "item1" }],
-          usage: {
-            itemCount: 1,
-            durationMs: 25,
-            outputHash: OUTPUT_HASH,
-            runnerSignature: RUNNER_SIG,
-            escrowSignature: ESCROW_SIG,
-          },
-        }));
+        return new Response(
+          JSON.stringify({
+            status: "SUCCEEDED",
+            result: [{ title: "item1" }],
+            dataset: [{ title: "item1" }],
+            usage: {
+              itemCount: 1,
+              durationMs: 25,
+              outputHash: OUTPUT_HASH,
+              runnerSignature: RUNNER_SIG,
+              escrowSignature: ESCROW_SIG,
+            },
+          }),
+        );
       }
       if (url.endsWith("/v1/contract/SETTLE_RESULT")) {
         settleBodies.push(JSON.parse(String(init?.body ?? "{}")));
-        return new Response(JSON.stringify({ status: "CONFIRMED", transaction: SETTLE_TX }));
+        return new Response(
+          JSON.stringify({ status: "CONFIRMED", transaction: SETTLE_TX }),
+        );
       }
       if (url.endsWith("/v1/receipt")) {
-        return new Response(JSON.stringify({ status: "CONFIRMED", transaction: RECEIPT_TX }));
+        return new Response(
+          JSON.stringify({ status: "CONFIRMED", transaction: RECEIPT_TX }),
+        );
       }
       throw new Error(`unexpected fetch ${url}`);
     });
@@ -320,8 +358,12 @@ describe("Gateway ReceiveWithAuthorization & Escrow Timeout", () => {
       payload: { input: { query: "ai" } },
     });
     expect(first.statusCode).toBe(402);
-    const required = decodePaymentRequiredHeader(first.headers["payment-required"] as string);
-    expect(required.accepts[0]?.extra?.authorizationType).toBe("ReceiveWithAuthorization");
+    const required = decodePaymentRequiredHeader(
+      first.headers["payment-required"] as string,
+    );
+    expect(required.accepts[0]?.extra?.authorizationType).toBe(
+      "ReceiveWithAuthorization",
+    );
 
     const sigHeader = encodePaymentSignatureHeader({
       x402Version: 2,
@@ -371,7 +413,10 @@ describe("Gateway ReceiveWithAuthorization & Escrow Timeout", () => {
     let updatedState = "";
     let updatedRefund = "";
     const pool: GatewayPool = {
-      async query<R = Record<string, unknown>>(sql: string, values: unknown[] = []): Promise<{ rows: R[] }> {
+      async query<R = Record<string, unknown>>(
+        sql: string,
+        values: unknown[] = [],
+      ): Promise<{ rows: R[] }> {
         const q = sql.replace(/\s+/g, " ").trim();
         if (q.includes("WHERE pricing_model='PAY_PER_RESULT'")) {
           return {
@@ -380,7 +425,11 @@ describe("Gateway ReceiveWithAuthorization & Escrow Timeout", () => {
             ] as unknown as R[],
           };
         }
-        if (q.startsWith("UPDATE facet_demo_runs SET status='FAILED', payment_state='PENDING'")) {
+        if (
+          q.startsWith(
+            "UPDATE facet_demo_runs SET status='FAILED', payment_state='PENDING'",
+          )
+        ) {
           return { rows: [{ id: staleRunId }] as unknown as R[] };
         }
         if (q.startsWith("UPDATE facet_demo_runs SET payment_state=$2")) {
@@ -392,7 +441,13 @@ describe("Gateway ReceiveWithAuthorization & Escrow Timeout", () => {
       },
     };
     vi.spyOn(globalThis, "fetch").mockResolvedValue(
-      new Response(JSON.stringify({ status: "CONFIRMED", transaction: REFUND_TX, alreadyRefunded: true })),
+      new Response(
+        JSON.stringify({
+          status: "CONFIRMED",
+          transaction: REFUND_TX,
+          alreadyRefunded: true,
+        }),
+      ),
     );
 
     await reconcileStaleEscrows(pool, PAYMENT_CONFIG);

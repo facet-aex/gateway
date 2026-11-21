@@ -117,7 +117,9 @@ export async function reconcileStaleEscrows(
           row.id,
           refund.status === "CONFIRMED" ? "REFUNDED" : "PENDING",
           refund.transaction,
-          refund.status === "CONFIRMED" ? (row.max_amount_atomic ?? null) : null,
+          refund.status === "CONFIRMED"
+            ? (row.max_amount_atomic ?? null)
+            : null,
         ],
       );
     } catch {
