@@ -15,6 +15,7 @@ export interface DemoPaymentConfig {
   facilitatorUrl: string;
   facilitatorToken: string;
   payTo?: string;
+  feeSplitAddress?: string;
   amount: string;
 }
 export interface VersionQuote {
@@ -56,6 +57,7 @@ export function readPaymentConfig(
   const facilitatorUrl = env.FACET_FACILITATOR_URL;
   const facilitatorToken = env.FACET_FACILITATOR_TOKEN;
   const payTo = env.FACET_DEMO_PAY_TO?.trim() || undefined;
+  const feeSplitAddress = env.FACET_FEE_SPLIT_ADDRESS?.trim() || undefined;
   const amount = env.FACET_DEMO_AMOUNT_ATOMIC ?? "1000";
   let facilitatorHostname = "";
   if (facilitatorUrl) {
@@ -79,6 +81,7 @@ export function readPaymentConfig(
     facilitatorUrl,
     facilitatorToken,
     ...(payTo ? { payTo } : {}),
+    ...(feeSplitAddress ? { feeSplitAddress } : {}),
     amount,
   };
 }
@@ -91,6 +94,9 @@ export function requirements(
   if (!payTo || !ADDRESS.test(payTo))
     throw new Error("PAYMENT_RECIPIENT_INVALID");
   if (quote && isPaidQuote(quote)) {
+    const isContractRoute = config.feeSplitAddress
+      ? payTo.toLowerCase() === config.feeSplitAddress.toLowerCase()
+      : payTo.toLowerCase() !== quote.creatorPayTo.toLowerCase();
     return {
       scheme: "exact",
       network,
@@ -101,6 +107,9 @@ export function requirements(
       extra: {
         name: "FACET USD",
         version: "2",
+        ...(isContractRoute
+          ? { authorizationType: "ReceiveWithAuthorization" }
+          : {}),
         pricingModel: quote.pricingModel,
         unitPriceAtomic: quote.unitPriceAtomic,
         ...(quote.pricingModel === "PAY_PER_RESULT" &&
@@ -111,6 +120,9 @@ export function requirements(
       },
     };
   }
+  const isLegacyContract =
+    Boolean(config.feeSplitAddress) &&
+    payTo.toLowerCase() === config.feeSplitAddress!.toLowerCase();
   return {
     scheme: "exact",
     network,
@@ -118,7 +130,13 @@ export function requirements(
     amount: quote?.amount ?? config.amount,
     payTo,
     maxTimeoutSeconds: 60,
-    extra: { name: "FACET USD", version: "2" },
+    extra: {
+      name: "FACET USD",
+      version: "2",
+      ...(isLegacyContract
+        ? { authorizationType: "ReceiveWithAuthorization" }
+        : {}),
+    },
   };
 }
 
@@ -211,6 +229,8 @@ export function decodeAndCheckPayment(
       ) {
         return false;
       }
+      if (extra.authorizationType !== expected.extra?.authorizationType)
+        return false;
       if (extra.pricingModel !== quote.pricingModel) return false;
       if (extra.unitPriceAtomic !== quote.unitPriceAtomic) return false;
       if (
@@ -240,6 +260,7 @@ export function decodeAndCheckPayment(
   if (quoteOrQuotes && isPaidQuote(quoteOrQuotes)) {
     const extra = accepted.extra as Record<string, unknown>;
     if (
+      extra.authorizationType !== expected.extra?.authorizationType ||
       extra.pricingModel !== quoteOrQuotes.pricingModel ||
       extra.unitPriceAtomic !== quoteOrQuotes.unitPriceAtomic ||
       typeof extra.providerPayTo !== "string" ||
@@ -329,7 +350,12 @@ export async function contractPaymentCall(
   config: DemoPaymentConfig,
   phase: ContractPhase,
   body: Record<string, unknown>,
-): Promise<{ status: "PENDING" | "CONFIRMED"; transaction: string }> {
+): Promise<{
+  status: "PENDING" | "CONFIRMED";
+  transaction: string;
+  escrowExpiresAt?: string;
+  alreadyRefunded?: boolean;
+}> {
   const response = await fetch(
     new URL(`/v1/contract/${phase}`, config.facilitatorUrl),
     {
@@ -351,7 +377,12 @@ export async function contractPaymentCall(
     !/^0x[0-9a-f]{64}$/iu.test(result.transaction)
   )
     throw new Error("CONTRACT_RESPONSE_INVALID");
-  return result as { status: "PENDING" | "CONFIRMED"; transaction: string };
+  return result as {
+    status: "PENDING" | "CONFIRMED";
+    transaction: string;
+    escrowExpiresAt?: string;
+    alreadyRefunded?: boolean;
+  };
 }
 
 export async function recordReceiptCall(

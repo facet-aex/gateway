@@ -24,6 +24,7 @@ export interface RunSnapshotRow {
   max_amount_atomic?: string | null;
   deposit_tx_hash?: string | null;
   refund_amount_atomic?: string | null;
+  escrow_expires_at?: string | null;
 }
 
 export interface InvokeFacetPaymentV016 {
@@ -36,6 +37,7 @@ export interface InvokeFacetPaymentV016 {
   depositedAmountAtomic?: string;
   refundAmountAtomic?: string;
   depositTxHash?: string;
+  escrowExpiresAt?: string;
   payer: string;
   providerPayTo: string;
   payTo?: string;
@@ -80,11 +82,17 @@ export function usageProof(
       : run.input_hash && /^[0-9a-f]{64}$/iu.test(run.input_hash)
         ? `sha256:${run.input_hash}`
         : `sha256:${run.request_fingerprint}`;
+  const escrowSignature =
+    typeof usage.escrowSignature === "string" &&
+    /^0x[0-9a-f]{130}$/iu.test(usage.escrowSignature)
+      ? usage.escrowSignature
+      : undefined;
   return {
     inputHash,
     outputHash: usage.outputHash,
     itemCount: Number(usage.itemCount),
     runnerSignature: usage.runnerSignature,
+    ...(escrowSignature ? { escrowSignature } : {}),
   };
 }
 
@@ -253,6 +261,9 @@ export function buildPaidMetadata(
       depositedAmountAtomic,
       refundAmountAtomic,
       ...(run.deposit_tx_hash ? { depositTxHash: run.deposit_tx_hash } : {}),
+      ...(run.escrow_expires_at
+        ? { escrowExpiresAt: run.escrow_expires_at }
+        : {}),
       payer,
       providerPayTo: quote.creatorPayTo,
       payTo: quote.payTo,

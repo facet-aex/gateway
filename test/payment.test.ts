@@ -253,6 +253,7 @@ describe("Gateway x402 challenge", () => {
     expect(challenge.body.accepts[0]?.extra).toEqual({
       name: "FACET USD",
       version: "2",
+      authorizationType: "ReceiveWithAuthorization",
       pricingModel: "PAY_PER_RUN",
       unitPriceAtomic: "1000",
       providerPayTo: creator,
@@ -261,6 +262,7 @@ describe("Gateway x402 challenge", () => {
     expect(challenge.body.accepts[1]?.extra).toEqual({
       name: "FACET USD",
       version: "2",
+      authorizationType: "ReceiveWithAuthorization",
       pricingModel: "PAY_PER_RESULT",
       unitPriceAtomic: "500",
       maxItemsCap: 10,
